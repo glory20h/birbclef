@@ -1,0 +1,24 @@
+# Dataset Paths
+birb_20_path: '/mnt/work4/datasets/lyh/birdsong-recognition'
+birb_21_path: '/mnt/work4/datasets/lyh/birdclef-2021'
+birb_22_path: '/mnt/work4/datasets/lyh/birdclef-2022'
+xc_am_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-a-m'
+xc_nz_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-n-z'
+birb_23_path: '/mnt/work4/datasets/lyh/birdclef-2023'
+
+pt_ckpt: 'results/pt/6L-first-try/checkpoint-epoch=30.ckpt'
+exp_dir: 'results/ft/6L-mp3e-1-tl512-bce'
+
+batch_size: 16
+ngpus: 4
+accumulate_grad_batches: 1
+use_fp16: False
+epochs: 50
+lr: 1e-4
+
+target_len: 2048
+depth: 6
+num_classes: 575
+
+mask_t_prob: 0.3
+mask_f_prob: 0.3
