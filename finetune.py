@@ -16,7 +16,6 @@ from torch.utils.data import Dataset, DataLoader
 import torchaudio
 from torchaudio.compliance import kaldi
 
-from sklearn import metrics
 from sklearn.model_selection import StratifiedKFold
 from sklearn.model_selection import train_test_split
 
@@ -26,15 +25,20 @@ from pytorch_lightning.callbacks.progress import TQDMProgressBar
 from pytorch_lightning.utilities.rank_zero import rank_zero_info
 
 from audio_mae import models_mae
-from utils import unwrap_checkpoints
+from utils import (
+    get_last_checkpoint,
+    unwrap_checkpoints,
+    load_pl_state_dict,
+    padded_cmap,
+)
 
 
 class BirbDataset(Dataset):
-    def __init__(self, dataframe):
+    def __init__(self, dataframe, target_len):
         self.df = dataframe
         
         self.melbins = 128
-        self.target_len = cfg.target_len
+        self.target_len = target_len
         
     def wav2fbank(self, filename):
         waveform, sr = torchaudio.load(filename)
@@ -87,26 +91,6 @@ class BirbDataset(Dataset):
         return len(self.df)
 
 
-def load_pl_state_dict(ckpt_path, prefix='model'):
-    ckpt = torch.load(ckpt_path, map_location='cpu')
-    new_state_dict = {k[len(prefix)+1:] :v for k, v in ckpt['state_dict'].items() if 'pos_embed' not in k}
-    return new_state_dict
-
-
-def padded_cmap(solution, submission, padding_factor=5):
-    pad = np.ones((padding_factor, cfg.num_classes))
-    
-    padded_solution = np.concatenate((solution, pad), axis=0)
-    padded_submission = np.concatenate((submission, pad), axis=0)
-    
-    score = metrics.average_precision_score(
-        padded_solution,
-        padded_submission,
-        average='macro',
-    )
-    return score
-
-
 class ModelWrapper(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -123,25 +107,36 @@ class ModelWrapper(nn.Module):
             decoder_mode=1,
             decoder_depth=16,
         )
-        if cfg.pt_ckpt is not None:
-            state_dict = load_pl_state_dict(cfg.pt_ckpt)
-            self.model.load_state_dict(state_dict, strict=False)
+        self.remove_decoder()
 
-        # Remove decoder
+        self.clf_head = nn.Sequential(
+            nn.Linear(768, 768),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(768, cfg.num_classes),
+        )
+
+        if cfg.init_ckpt is not None:
+            self.load_ckpt(cfg.init_ckpt, cfg.ft_stage)
+
+    def remove_decoder(self):
         self.model.mask_token = None
         self.model.decoder_pos_embed = None
         self.model.decoder_embed = None
         self.model.decoder_blocks = None
         self.model.decoder_norm = None
         self.model.decoder_pred = None
-        
-        self.clf_head = nn.Sequential(
-            nn.Linear(768, 768),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(768, cfg.num_classes),
-            # nn.Linear(768, 528),
-        )
+
+    def load_ckpt(self, ckpt, stage):
+        if stage == 1:
+            state_dict = load_pl_state_dict(ckpt)
+            self.model.load_state_dict(state_dict, strict=False)
+        elif stage == 2:
+            ckpt = torch.load(ckpt, map_location='cpu')
+            new_state_dict = {k[6:] :v for k, v in ckpt['state_dict'].items() if 'pos_embed' not in k}
+            del new_state_dict['clf_head.3.weight']
+            del new_state_dict['clf_head.3.bias']
+            self.load_state_dict(new_state_dict, strict=False)
         
     def forward(self, x, mask_t_prob, mask_f_prob):
         x = self.model.enc_forward(x, mask_t_prob, mask_f_prob)
@@ -153,11 +148,13 @@ class ModelWrapper(nn.Module):
 class FineTuningModule(LightningModule):
     def __init__(self, cfg, train_df, val_df):
         super().__init__()
+        self.cfg = cfg
+
         self.batch_size = cfg.batch_size
         self.model = ModelWrapper(cfg)
 
-        self.train_data = BirbDataset(train_df)
-        self.eval_data = BirbDataset(val_df)
+        self.train_data = BirbDataset(train_df, cfg.target_len)
+        self.eval_data = BirbDataset(val_df, cfg.target_len)
 
         self.validation_step_logits = []
         self.validation_step_targets = []
@@ -165,7 +162,7 @@ class FineTuningModule(LightningModule):
     def configure_optimizers(self):
         return torch.optim.AdamW(
             self.parameters(),
-            lr=LR,
+            lr=self.cfg.lr,
             betas=(0.9, 0.95),
             eps=1e-6,
             weight_decay=1e-4,
@@ -183,7 +180,7 @@ class FineTuningModule(LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        x = self.model(batch[0], cfg.mask_t_prob, cfg.mask_f_prob)
+        x = self.model(batch[0], self.cfg.mask_t_prob, self.cfg.mask_f_prob)
         loss = F.cross_entropy(x, batch[1])
         # loss = F.binary_cross_entropy_with_logits(x, batch[1])
 
@@ -206,11 +203,11 @@ class FineTuningModule(LightningModule):
         target = torch.cat(self.validation_step_targets)
 
         pred = F.softmax(pred, dim=-1).cpu().detach().numpy()
-        target = F.one_hot(target, num_classes=NUM_CLASSES).cpu().numpy()
+        target = F.one_hot(target, num_classes=self.cfg.num_classes).cpu().numpy()
         # target = target.cpu().numpy()
 
-        cmap_pad_5 = padded_cmap(target, pred)
-        cmap_pad_1 = padded_cmap(target, pred, padding_factor=1)
+        cmap_pad_5 = padded_cmap(target, pred, self.cfg.num_classes)
+        cmap_pad_1 = padded_cmap(target, pred, self.cfg.num_classes, padding_factor=1)
 
         self.log("cmAP5", cmap_pad_5)
         self.log("cmAP1", cmap_pad_1)
@@ -233,11 +230,11 @@ class FineTuningModule(LightningModule):
         target = torch.cat(self.test_step_targets)
 
         pred = F.softmax(pred, dim=-1).cpu().detach().numpy()
-        target = F.one_hot(target, num_classes=cfg.num_classes).cpu().numpy()
+        target = F.one_hot(target, num_classes=self.cfg.num_classes).cpu().numpy()
         # target = target.cpu().numpy()
 
-        cmap_pad_5 = padded_cmap(target, pred)
-        cmap_pad_1 = padded_cmap(target, pred, padding_factor=1)
+        cmap_pad_5 = padded_cmap(target, pred, self.cfg.num_classes)
+        cmap_pad_1 = padded_cmap(target, pred, self.cfg.num_classes, padding_factor=1)
 
         self.log("cmAP5", cmap_pad_5)
         self.log("cmAP1", cmap_pad_1)
@@ -245,27 +242,26 @@ class FineTuningModule(LightningModule):
         self.test_step_logits.clear()
         self.test_step_targets.clear()
 
-
     def train_dataloader(self):
         return DataLoader(
             self.train_data, 
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=cfg.ngpus*4,
+            num_workers=self.cfg.ngpus*4,
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.eval_data, 
             batch_size=self.batch_size, 
-            num_workers=cfg.ngpus*4,
+            num_workers=self.cfg.ngpus*4,
         )
 
     def test_dataloader(self):
         return DataLoader(
             self.eval_data, 
             batch_size=self.batch_size, 
-            num_workers=cfg.ngpus*4,
+            num_workers=self.cfg.ngpus*4,
         )
 
 
@@ -279,7 +275,7 @@ class CustomProgressBar(TQDMProgressBar):
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument('-c', '-cfg', '--config', default='conf/ft.yaml', help='config path for training')
+    parser.add_argument('-c', '-cfg', '--config', help='config path for training')
     parser.add_argument('-t', '--test', action='store_true', help='whether to run the script in testing mode')
     parser.add_argument('--test_ckpt', help='pl ckpt path for testing')
     args = parser.parse_args()
@@ -348,19 +344,44 @@ def main():
     df_xc.rename(columns={"ebird_code": "primary_label"}, inplace=True)
     df_xc['birdclef'] = 'xc'
 
-    df_all = pd.concat([df_20, df_21, df_22, df_xc], axis=0, ignore_index=True)
-    nodup_idx = df_all[['xc_id']].drop_duplicates().index
-    df_all = df_all.loc[nodup_idx].reset_index(drop=True)
-    corrupt_files = json.load(open('corrupt_files.json', 'r'))
-    df_all = df_all[~df_all.filename.isin(corrupt_files)]
-    corrupt_files = json.load(open('corrupt_files2.json', 'r'))
-    df_all = df_all[~df_all.filename.isin(corrupt_files)]
-    df_all = df_all.reset_index(drop=True)
+    df_23 = pd.read_csv(f'{cfg.birb_23_path}/train_metadata.csv')
+    df_23['filepath'] = cfg.birb_23_path + '/train_audio/' + df_23.filename
+    df_23['filename'] = df_23.filename.map(lambda x: x.split('/')[-1])
+    df_23['xc_id'] = df_23.filename.map(lambda x: x.split('.')[0])
+    df_23 = df_23[['filepath', 'filename', 'primary_label', 'xc_id']]
+    df_23['birdclef'] = '23'
 
-    class_names = sorted(list(df_all.primary_label.unique()))
-    class_labels = list(range(len(class_names)))
-    n2l = dict(zip(class_names, class_labels))
-    df_all['label'] = df_all.primary_label.map(lambda x: n2l[x])
+    if cfg.ft_stage == 1:
+        df_all = pd.concat([df_20, df_21, df_22, df_xc], axis=0, ignore_index=True)
+        nodup_idx = df_all[['xc_id']].drop_duplicates().index
+        df_all = df_all.loc[nodup_idx].reset_index(drop=True)
+        corrupt_files = json.load(open('corrupt_files.json', 'r'))
+        df_all = df_all[~df_all.filename.isin(corrupt_files)]
+        corrupt_files = json.load(open('corrupt_files2.json', 'r'))
+        df_all = df_all[~df_all.filename.isin(corrupt_files)]
+        df_all = df_all.reset_index(drop=True)
+
+        class_names = sorted(list(df_all.primary_label.unique()))
+        class_labels = list(range(len(class_names)))
+        n2l = dict(zip(class_names, class_labels))
+        df_all['label'] = df_all.primary_label.map(lambda x: n2l[x])
+
+    elif cfg.ft_stage == 2:
+        class_names = sorted(os.listdir(os.path.join(cfg.birb_23_path, 'train_audio')))
+        class_labels = list(range(len(class_names)))
+        n2l = dict(zip(class_names, class_labels))
+
+        df_all = pd.concat([df_20, df_21, df_22, df_xc, df_23], axis=0, ignore_index=True)
+        nodup_idx = df_all[['xc_id']].drop_duplicates().index
+        df_all = df_all.loc[nodup_idx].reset_index(drop=True)
+        corrupt_files = json.load(open('corrupt_files.json', 'r'))
+        df_all = df_all[~df_all.filename.isin(corrupt_files)]
+        corrupt_files = json.load(open('corrupt_files2.json', 'r'))
+        df_all = df_all[~df_all.filename.isin(corrupt_files)]
+        df_all = df_all[df_all.primary_label.isin(class_names)]
+        df_all = df_all.reset_index(drop=True)
+
+        df_all['label'] = df_all.primary_label.map(lambda x: n2l[x])
 
     skf = StratifiedKFold(n_splits=20, shuffle=True, random_state=2023)
     df_all["fold"] = -1
@@ -398,7 +419,7 @@ def main():
     if args.test:
         trainer.test(model, ckpt_path=args.ckpt_path)
     else:
-        trainer.fit(model, ckpt_path=None)
+        trainer.fit(model, ckpt_path=get_last_checkpoint(cfg.exp_dir))
 
     unwrap_checkpoints(cfg.exp_dir)
 
