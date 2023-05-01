@@ -59,11 +59,14 @@ class BirbDataset(Dataset):
         # ESC: 512 (8K sr)
         n_frames = fbank.shape[0]
         p = self.target_len - n_frames
-        # cut and pad
+        
         if p > 0:
-            m = torch.nn.ZeroPad2d((0, 0, 0, p))
-            fbank = m(fbank)
+            # repeat
+            # m = torch.nn.ZeroPad2d((0, 0, 0, p))
+            # fbank = m(fbank)
+            fbank = fbank.repeat(math.ceil(target_len / n_frames), 1)[:target_len]
         elif p < 0:
+            # cut
             i = random.randint(0, -p)
             fbank = fbank[i:i+self.target_len, :]
         return fbank

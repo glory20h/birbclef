@@ -16,7 +16,7 @@ import torch.nn as nn
 import numpy as np
 import timm.models.vision_transformer
 from timm.models.vision_transformer import PatchEmbed, Block
-from util.patch_embed import PatchEmbed_new, PatchEmbed3D_new
+from .util.patch_embed import PatchEmbed_new, PatchEmbed3D_new
 
 
 class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
