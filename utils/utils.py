@@ -32,15 +32,13 @@ def load_pl_state_dict(ckpt_path, prefix='model'):
     return new_state_dict
 
 
-def padded_cmap(solution, submission, num_classes, padding_factor=5):
-    pad = np.ones((padding_factor, num_classes))
+def padded_cmap(y_true, y_pred, padding_factor=5):
+    num_classes = y_true.shape[1]
+    pad_rows = np.ones((padding_factor, num_classes))
     
-    padded_solution = np.concatenate((solution, pad), axis=0)
-    padded_submission = np.concatenate((submission, pad), axis=0)
+    y_true = np.concatenate((y_true, pad_rows), axis=0)
+    y_pred = np.concatenate((y_pred, pad_rows), axis=0)
     
-    score = metrics.average_precision_score(
-        padded_solution,
-        padded_submission,
-        average='macro',
-    )
+    score = metrics.average_precision_score(y_true, y_pred, average='macro')
+
     return score

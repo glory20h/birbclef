@@ -88,6 +88,8 @@ class BirbDataset(Dataset):
 class PreTrainingModule(LightningModule):
     def __init__(self, cfg, train_df, val_df):
         super().__init__()
+        self.cfg = cfg
+
         self.batch_size = cfg.batch_size
         self.model = models_mae.MaskedAutoencoderViT(
             patch_size=16, 
@@ -111,7 +113,7 @@ class PreTrainingModule(LightningModule):
     def configure_optimizers(self):
         return torch.optim.AdamW(
             self.parameters(),
-            lr=LR,
+            lr=self.cfg.lr,
             betas=(0.9, 0.999),
             eps=1e-6,
             weight_decay=0.01,
@@ -129,19 +131,19 @@ class PreTrainingModule(LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        loss, pred, mask, _ = self.model(batch, mask_ratio=cfg.mask_ratio)
+        loss, pred, mask, _ = self.model(batch, mask_ratio=self.cfg.mask_ratio)
 
         self.log("loss", loss)
 
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, pred, mask, _ = self.model(batch, mask_ratio=cfg.mask_ratio)
+        loss, pred, mask, _ = self.model(batch, mask_ratio=self.cfg.mask_ratio)
 
         self.log("val_loss", loss)
 
     def test_step(self, batch, batch_idx):
-        loss, pred, mask, _ = self.model(batch, mask_ratio=cfg.mask_ratio)
+        loss, pred, mask, _ = self.model(batch, mask_ratio=self.cfg.mask_ratio)
 
         self.log("val_loss", loss)
 
@@ -149,21 +151,21 @@ class PreTrainingModule(LightningModule):
         return DataLoader(
             self.train_data, 
             batch_size=self.batch_size, 
-            num_workers=cfg.ngpus*8,
+            num_workers=self.cfg.ngpus*8,
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.eval_data, 
             batch_size=self.batch_size, 
-            num_workers=cfg.ngpus*4,
+            num_workers=self.cfg.ngpus*4,
         )
 
     def test_dataloader(self):
         return DataLoader(
             self.eval_data, 
             batch_size=self.batch_size, 
-            num_workers=cfg.ngpus*4,
+            num_workers=self.cfg.ngpus*4,
         )
 
 
@@ -177,7 +179,7 @@ class CustomProgressBar(TQDMProgressBar):
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument('-c', '-cfg', '--config', default='conf/ft.yaml', help='config path for training')
+    parser.add_argument('-c', '-cfg', '--config', default='conf/pt.yaml', help='config path for training')
     parser.add_argument('-t', '--test', action='store_true', help='whether to run the script in testing mode')
     parser.add_argument('--test_ckpt', help='pl ckpt path for testing')
     args = parser.parse_args()
@@ -245,7 +247,7 @@ def main():
     # split the data into train and validation sets
     train_df, val_df = train_test_split(df_all, test_size=0.05, random_state=2023)
 
-    model = PreTrainingModule(cfg, train_data, eval_data)
+    model = PreTrainingModule(cfg, train_df, val_df)
 
     os.makedirs(cfg.exp_dir, exist_ok=True)
 

@@ -64,7 +64,7 @@ class BirbDataset(Dataset):
             # repeat
             # m = torch.nn.ZeroPad2d((0, 0, 0, p))
             # fbank = m(fbank)
-            fbank = fbank.repeat(math.ceil(target_len / n_frames), 1)[:target_len]
+            fbank = fbank.repeat(math.ceil(self.target_len / n_frames), 1)[:self.target_len]
         elif p < 0:
             # cut
             i = random.randint(0, -p)
@@ -209,8 +209,8 @@ class FineTuningModule(LightningModule):
         target = F.one_hot(target, num_classes=self.cfg.num_classes).cpu().numpy()
         # target = target.cpu().numpy()
 
-        cmap_pad_5 = padded_cmap(target, pred, self.cfg.num_classes)
-        cmap_pad_1 = padded_cmap(target, pred, self.cfg.num_classes, padding_factor=1)
+        cmap_pad_5 = padded_cmap(target, pred)
+        cmap_pad_1 = padded_cmap(target, pred, padding_factor=1)
 
         self.log("cmAP5", cmap_pad_5)
         self.log("cmAP1", cmap_pad_1)
@@ -236,8 +236,8 @@ class FineTuningModule(LightningModule):
         target = F.one_hot(target, num_classes=self.cfg.num_classes).cpu().numpy()
         # target = target.cpu().numpy()
 
-        cmap_pad_5 = padded_cmap(target, pred, self.cfg.num_classes)
-        cmap_pad_1 = padded_cmap(target, pred, self.cfg.num_classes, padding_factor=1)
+        cmap_pad_5 = padded_cmap(target, pred)
+        cmap_pad_1 = padded_cmap(target, pred, padding_factor=1)
 
         self.log("cmAP5", cmap_pad_5)
         self.log("cmAP1", cmap_pad_1)
