@@ -19,41 +19,33 @@ from torchaudio.compliance import kaldi
 
 from sklearn.model_selection import StratifiedKFold
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 
 from pytorch_lightning import LightningModule, Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.callbacks.progress import TQDMProgressBar
 from pytorch_lightning.utilities.rank_zero import rank_zero_info
 
-from audio_mae import models_mae
+from models import TimmSED
 from utils import (
     dump_yaml,
     get_last_checkpoint,
     unwrap_checkpoints,
     load_pl_state_dict,
-    load_state_dict_with_mismatch,
+    padded_cmap,
+    filter_data,
+    upsample_data,
+    downsample_data,
+    mixup,
+    BCEFocal2WayLoss,
 )
 
 
-class BirbDataset(Dataset):
+class BirbDataset2(Dataset):
     def __init__(self, cfg, dataframe, augment=True):
         self.df = dataframe
         self.duration = cfg.duration
-        self.melbins = cfg.melbins
         self.augment = augment
-        
-    def wav2fbank(self, audio, sr):
-        fbank = kaldi.fbank(
-            audio.unsqueeze(0), 
-            htk_compat=True, 
-            sample_frequency=sr, 
-            use_energy=False,
-            window_type='hanning', 
-            num_mel_bins=self.melbins, 
-            dither=0.0, 
-            frame_shift=10
-        )
-        return fbank
     
     def load_audio(self, filename, target_sr=32000):
         audio, sr = torchaudio.load(filename)
@@ -63,7 +55,7 @@ class BirbDataset(Dataset):
         return audio[0], sr
     
     def cut_or_repeat(self, audio, sr):
-        target_len = int(sr * self.duration)
+        target_len = sr * self.duration
         p = target_len - len(audio)
 
         if p > 0:
@@ -93,55 +85,49 @@ class BirbDataset(Dataset):
     def __getitem__(self, index):
         row = self.df.iloc[index]
         filename = row.filepath
+        label = row.label
         
         audio, sr = self.load_audio(filename)
         audio = self.cut_or_repeat(audio, sr)
         audio = self.normalize(audio)
-            
-        fb = self.wav2fbank(audio, sr)
+        if self.augment and random.random() > 0.5:
+            audio = self.add_gaussian_noise(audio)
         
-        return fb
+        return audio, label
 
     def __len__(self):
         return len(self.df)
 
 
-class PreTrainingModule(LightningModule):
+criterion = BCEFocal2WayLoss()
+def mixup_criterion(preds, new_targets):
+    targets1, targets2, lam = new_targets[0], new_targets[1], new_targets[2]
+    return lam * criterion(preds, targets1) + (1 - lam) * criterion(preds, targets2)
+
+
+class FineTuningModule(LightningModule):
     def __init__(self, cfg, train_df, val_df):
         super().__init__()
         self.cfg = cfg
 
         self.batch_size = cfg.batch_size
-        self.model = models_mae.MaskedAutoencoderViT(
-            patch_size=16, 
-            embed_dim=cfg.embed_dim, 
-            depth=cfg.depth, 
-            num_heads=cfg.num_heads,
-            mlp_ratio=4, 
-            norm_layer=partial(nn.LayerNorm, eps=1e-6),
-            in_chans=1,
-            audio_exp=True,
-            img_size=(1024, 128),
-            decoder_mode=1,
-            decoder_depth=16,
-        )
-        if cfg.ckpt is not None:
-            ckpt = torch.load(cfg.ckpt, map_location='cpu')
-            try:
-                self.model.load_state_dict(ckpt['model'], strict=False)
-            except:
-                load_state_dict_with_mismatch(self.model, ckpt['model'])
+        self.model = TimmSED(cfg)
 
-        self.train_data = BirbDataset(cfg, train_df)
-        self.eval_data = BirbDataset(cfg, val_df, augment=False)
+        self.train_data = BirbDataset2(cfg, train_df)
+        self.eval_data = BirbDataset2(cfg, val_df, augment=False)
+
+        self.validation_step_logits = []
+        self.validation_step_targets = []
+        self.test_step_logits = []
+        self.test_step_targets = []
 
     def configure_optimizers(self):
         return torch.optim.AdamW(
             self.parameters(),
             lr=self.cfg.lr,
-            betas=(0.9, 0.999),
+            betas=(0.9, 0.95),
             eps=1e-6,
-            weight_decay=0.01,
+            weight_decay=1e-4,
         )
 
     def log(self, name, value, on_step=None, on_epoch=None):
@@ -156,33 +142,89 @@ class PreTrainingModule(LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        loss, pred, mask, _ = self.model(batch.unsqueeze(1), mask_ratio=self.cfg.mask_ratio)
+        inputs = batch[0]
+        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes)
 
-        if torch.isnan(loss):
-            torch.save(batch, 'prob_batch.pt')
-            torch.save(self.model.state_dict(), 'prob_ckpt.pt')
-
-            raise Exception("Nan loss?")
+        if random.random() > self.cfg.mixup_prob:
+            inputs, new_targets = mixup(inputs, targets, 0.4)
+            outputs = self.model(inputs)
+            loss = mixup_criterion(outputs, new_targets)
+        else:
+            outputs = self.model(inputs)
+            loss = criterion(outputs, targets)
 
         self.log("loss", loss)
 
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, pred, mask, _ = self.model(batch.unsqueeze(1), mask_ratio=self.cfg.mask_ratio)
+        inputs = batch[0]
+        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes)
+
+        outputs = self.model(inputs)
+        loss = criterion(outputs, targets)
 
         self.log("val_loss", loss)
+
+        self.validation_step_logits.append(outputs['logit'])
+        self.validation_step_targets.append(targets)
+
+    def on_validation_epoch_end(self):
+        logits = torch.cat(self.validation_step_logits)
+        targets = torch.cat(self.validation_step_targets)
+
+        probs = torch.sigmoid(logits).cpu().detach().numpy()
+        target = targets.cpu().numpy()
+
+        cmap_pad_5 = padded_cmap(target, probs)
+        cmap_pad_1 = padded_cmap(target, probs, padding_factor=1)
+
+        acc = accuracy_score(np.argmax(target, axis=-1), np.argmax(probs, axis=-1))
+
+        self.log("cmAP5", cmap_pad_5)
+        self.log("cmAP1", cmap_pad_1)
+        self.log("acc", acc)
+
+        self.validation_step_logits.clear()
+        self.validation_step_targets.clear()
 
     def test_step(self, batch, batch_idx):
-        loss, pred, mask, _ = self.model(batch.unsqueeze(1), mask_ratio=self.cfg.mask_ratio)
+        inputs = batch[0]
+        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes)
 
-        self.log("val_loss", loss)
+        outputs = self.model(inputs)
+        loss = criterion(outputs, targets)
+
+        self.log("test_loss", loss)
+
+        self.test_step_logits.append(outputs['logit'])
+        self.test_step_targets.append(targets)
+
+    def on_test_epoch_end(self):
+        logits = torch.cat(self.test_step_logits)
+        targets = torch.cat(self.test_step_targets)
+
+        probs = torch.sigmoid(logits).cpu().detach().numpy()
+        target = targets.cpu().numpy()
+
+        cmap_pad_5 = padded_cmap(target, probs)
+        cmap_pad_1 = padded_cmap(target, probs, padding_factor=1)
+
+        acc = accuracy_score(np.argmax(target, axis=-1), np.argmax(probs, axis=-1))
+
+        self.log("cmAP5", cmap_pad_5)
+        self.log("cmAP1", cmap_pad_1)
+        self.log("acc", acc)
+
+        self.test_step_logits.clear()
+        self.test_step_targets.clear()
 
     def train_dataloader(self):
         return DataLoader(
             self.train_data, 
-            batch_size=self.batch_size, 
-            num_workers=self.cfg.ngpus*8,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.cfg.ngpus*4,
         )
 
     def val_dataloader(self):
@@ -255,21 +297,64 @@ def prepare_data(cfg):
     df_23 = df_23[['filepath', 'filename', 'primary_label', 'xc_id']]
     df_23['birdclef'] = '23'
 
-    df_all = pd.concat([df_20, df_21, df_22, df_23, df_xc], axis=0, ignore_index=True)
-    nodup_idx = df_all[['xc_id']].drop_duplicates().index
-    df_all = df_all.loc[nodup_idx].reset_index(drop=True)
-    corrupt_files = json.load(open('corrupt_files.json', 'r'))
-    df_all = df_all[~df_all.filename.isin(corrupt_files)]
-    corrupt_files = json.load(open('corrupt_files2.json', 'r'))
-    df_all = df_all[~df_all.filename.isin(corrupt_files)]
-    df_all = df_all.reset_index(drop=True)
+    if cfg.ft_stage == 1:
+        df_all = pd.concat([df_20, df_21, df_22, df_xc], axis=0, ignore_index=True)
+        nodup_idx = df_all[['xc_id']].drop_duplicates().index
+        df_all = df_all.loc[nodup_idx].reset_index(drop=True)
+        corrupt_files = json.load(open('corrupt_files.json', 'r'))
+        df_all = df_all[~df_all.filename.isin(corrupt_files)]
+        corrupt_files = json.load(open('corrupt_files2.json', 'r'))
+        df_all = df_all[~df_all.filename.isin(corrupt_files)]
+        df_all = df_all.reset_index(drop=True)
 
-    # split the data into train and validation sets
-    return train_test_split(df_all, test_size=0.05, random_state=2023)
+        class_names = sorted(list(df_all.primary_label.unique()))
+        class_labels = list(range(len(class_names)))
+        n2l = dict(zip(class_names, class_labels))
+        df_all['label'] = df_all.primary_label.map(lambda x: n2l[x])
+
+    elif cfg.ft_stage == 2:
+        class_names = sorted(os.listdir(os.path.join(cfg.birb_23_path, 'train_audio')))
+        class_labels = list(range(len(class_names)))
+        n2l = dict(zip(class_names, class_labels))
+
+        df_all = pd.concat([df_20, df_21, df_22, df_xc, df_23], axis=0, ignore_index=True)
+        nodup_idx = df_all[['xc_id']].drop_duplicates().index
+        df_all = df_all.loc[nodup_idx].reset_index(drop=True)
+        corrupt_files = json.load(open('corrupt_files.json', 'r'))
+        df_all = df_all[~df_all.filename.isin(corrupt_files)]
+        corrupt_files = json.load(open('corrupt_files2.json', 'r'))
+        df_all = df_all[~df_all.filename.isin(corrupt_files)]
+        df_all = df_all[df_all.primary_label.isin(class_names)]
+        df_all = df_all.reset_index(drop=True)
+
+        df_all['label'] = df_all.primary_label.map(lambda x: n2l[x])
+
+    skf = StratifiedKFold(n_splits=20, shuffle=True, random_state=2023)
+    df_all["fold"] = -1
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df_all, df_all['label'])):
+        df_all.loc[val_idx, 'fold'] = fold
+
+    # If apply filter
+    if cfg.filter_tail:
+        df_all = filter_data(df_all, thr=5)
+        train_df = df_all.query("fold!=0 | ~cv").reset_index(drop=True)
+        val_df = df_all.query("fold==0 & cv").reset_index(drop=True)
+    else:
+        train_df = df_all.query("fold!=0").reset_index(drop=True)
+        val_df = df_all.query("fold==0").reset_index(drop=True)
+        
+    # Upsample train data
+    if cfg.upsample_thr:
+        train_df = upsample_data(train_df, thr=cfg.upsample_thr, seed=cfg.seed)
+    if cfg.downsample_thr:
+        train_df = downsample_data(train_df, thr=cfg.downsample_thr, seed=cfg.seed)
+
+    return train_df, val_df
+
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument('-c', '-cfg', '--config', default='conf/pt.yaml', help='config path for training')
+    parser.add_argument('-c', '-cfg', '--config', default='conf/cnn.yaml', help='config path for training')
     parser.add_argument('-t', '--test', action='store_true', help='whether to run the script in testing mode')
     parser.add_argument('--test_ckpt', help='pl ckpt path for testing')
     args = parser.parse_args()
@@ -279,7 +364,7 @@ def main():
 
     train_df, val_df = prepare_data(cfg)
 
-    model = PreTrainingModule(cfg, train_df, val_df)
+    model = FineTuningModule(cfg, train_df, val_df)
 
     os.makedirs(cfg.exp_dir, exist_ok=True)
     dump_yaml(cfg, cfg.exp_dir)
@@ -289,7 +374,7 @@ def main():
         filename='checkpoint-{epoch:02d}',
         verbose=True,
         save_last=True,
-        save_top_k=1,
+        save_top_k=2,
         monitor="val_loss",
         mode="min",
     )
@@ -298,9 +383,10 @@ def main():
         default_root_dir=cfg.exp_dir,
         accumulate_grad_batches=cfg.accumulate_grad_batches,
         accelerator="gpu",
+        # strategy="ddp_find_unused_parameters_true" if cfg.ngpus > 1 else "auto",
         strategy="ddp" if cfg.ngpus > 1 else "auto",
         devices=cfg.ngpus,
-        # precision=16 if cfg.use_fp16 else 32,  # 16-mixed?
+        precision=16 if cfg.use_fp16 else 32,
         max_epochs=cfg.epochs,
         callbacks=[ckpt_callback, CustomProgressBar()],
     )
@@ -311,7 +397,6 @@ def main():
         trainer.fit(model, ckpt_path=get_last_checkpoint(cfg.exp_dir))
 
     unwrap_checkpoints(cfg.exp_dir)
-
 
 if __name__ == '__main__':
     main()

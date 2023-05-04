@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import math
 import random
 import pandas as pd
 import numpy as np
@@ -18,6 +19,7 @@ from torchaudio.compliance import kaldi
 
 from sklearn.model_selection import StratifiedKFold
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 
 from pytorch_lightning import LightningModule, Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
@@ -26,6 +28,7 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_info
 
 from audio_mae import models_mae
 from utils import (
+    dump_yaml,
     get_last_checkpoint,
     unwrap_checkpoints,
     load_pl_state_dict,
@@ -161,6 +164,8 @@ class FineTuningModule(LightningModule):
 
         self.validation_step_logits = []
         self.validation_step_targets = []
+        self.test_step_logits = []
+        self.test_step_targets = []
 
     def configure_optimizers(self):
         return torch.optim.AdamW(
@@ -276,16 +281,7 @@ class CustomProgressBar(TQDMProgressBar):
         return items
 
 
-def main():
-    parser = ArgumentParser()
-    parser.add_argument('-c', '-cfg', '--config', help='config path for training')
-    parser.add_argument('-t', '--test', action='store_true', help='whether to run the script in testing mode')
-    parser.add_argument('--test_ckpt', help='pl ckpt path for testing')
-    args = parser.parse_args()
-
-    cfg_path = args.config
-    cfg = OmegaConf.load(cfg_path)
-
+def prepare_data(cfg):
     # Data Preparation
     # class_names = sorted(os.listdir(os.path.join(BIRB_23_PATH, 'train_audio')))
     # class_labels = list(range(len(class_names)))
@@ -391,12 +387,40 @@ def main():
     for fold, (train_idx, val_idx) in enumerate(skf.split(df_all, df_all['label'])):
         df_all.loc[val_idx, 'fold'] = fold
 
-    train_df = df_all.query("fold!=0").reset_index(drop=True)
-    val_df = df_all.query("fold==0").reset_index(drop=True)
+    # If apply filter
+    if cfg.filter_tail:
+        df_all = filter_data(df_all, thr=5)
+        train_df = df_all.query("fold!=0 | ~cv").reset_index(drop=True)
+        val_df = df_all.query("fold==0 & cv").reset_index(drop=True)
+    else:
+        train_df = df_all.query("fold!=0").reset_index(drop=True)
+        val_df = df_all.query("fold==0").reset_index(drop=True)
+        
+    # Upsample train data
+    if cfg.upsample_thr:
+        train_df = upsample_data(train_df, thr=cfg.upsample_thr, seed=cfg.seed)
+    if cfg.downsample_thr:
+        train_df = downsample_data(train_df, thr=cfg.downsample_thr, seed=cfg.seed)
+
+    return train_df, val_df
+
+
+def main():
+    parser = ArgumentParser()
+    parser.add_argument('-c', '-cfg', '--config', help='config path for training')
+    parser.add_argument('-t', '--test', action='store_true', help='whether to run the script in testing mode')
+    parser.add_argument('--test_ckpt', help='pl ckpt path for testing')
+    args = parser.parse_args()
+
+    cfg_path = args.config
+    cfg = OmegaConf.load(cfg_path)
+
+    train_df, val_df = prepare_data(cfg)
 
     model = FineTuningModule(cfg, train_df, val_df)
 
     os.makedirs(cfg.exp_dir, exist_ok=True)
+    dump_yaml(cfg, cfg.exp_dir)
 
     ckpt_callback = ModelCheckpoint(
         dirpath=cfg.exp_dir,
@@ -412,7 +436,7 @@ def main():
         default_root_dir=cfg.exp_dir,
         accumulate_grad_batches=cfg.accumulate_grad_batches,
         accelerator="gpu",
-        strategy="ddp" if cfg.ngpus > 1 else "auto",
+        strategy="ddp_with_unused_paramet" if cfg.ngpus > 1 else "auto",
         devices=cfg.ngpus,
         precision=16 if cfg.use_fp16 else 32,
         max_epochs=cfg.epochs,
@@ -420,7 +444,7 @@ def main():
     )
 
     if args.test:
-        trainer.test(model, ckpt_path=args.ckpt_path)
+        trainer.test(model, ckpt_path=args.test_ckpt)
     else:
         trainer.fit(model, ckpt_path=get_last_checkpoint(cfg.exp_dir))
 

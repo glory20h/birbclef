@@ -15,7 +15,6 @@ from json import encoder
 import torch
 import torch.nn as nn
 
-#from timm.models.vision_transformer import PatchEmbed, Block
 from timm.models.vision_transformer import Block
 from .util.pos_embed import get_2d_sincos_pos_embed, get_2d_sincos_pos_embed_flexible, get_1d_sincos_pos_embed_from_grid
 from .util.misc import concat_all_gather
@@ -57,8 +56,8 @@ class MaskedAutoencoderViT(nn.Module):
         self.encoder_depth = depth
         self.contextual_depth = contextual_depth
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
-            # Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
+            # Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
@@ -75,35 +74,37 @@ class MaskedAutoencoderViT(nn.Module):
 
         self.decoder_mode = decoder_mode
         if self.use_custom_patch: # overlapped patches as in AST. Similar performance yet compute heavy
-            window_size= (6,6)
+            # window_size= (6,6)
+            window_size = 6
             feat_size = (102,12)
         else:
-            window_size= (4,4)
+            # window_size= (4,4)
+            window_size = 4
             feat_size = (64,8)                
         if self.decoder_mode == 1:
             decoder_modules = []
             for index in range(16):
                 if self.no_shift:
-                    shift_size = (0,0)
+                    shift_size = 0
                 else:
                     if (index % 2) == 0:
-                        shift_size = (0,0)
+                        shift_size = 0
                     else:
-                        shift_size = (2,0)
+                        shift_size = 2
                     #shift_size = tuple([0 if ((index % 2) == 0) else w // 2 for w in window_size])
                 decoder_modules.append(
                     SwinTransformerBlock(
                         dim=decoder_embed_dim,
                         num_heads=16,
-                        feat_size=feat_size,
+                        input_resolution=feat_size,
                         window_size=window_size,
                         shift_size=shift_size,
                         mlp_ratio=mlp_ratio,
                         drop=0.0,
-                        drop_attn=0.0,
+                        attn_drop=0.0,
                         drop_path=0.0,
-                        extra_norm=False,
-                        sequential_attn=False,
+                        # extra_norm=False,
+                        # sequential_attn=False,
                         norm_layer=norm_layer, #nn.LayerNorm,
                     )
                 )
@@ -111,8 +112,8 @@ class MaskedAutoencoderViT(nn.Module):
         else:
             # Transfomer
             self.decoder_blocks = nn.ModuleList([
-                Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
-                # Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
+                # Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+                Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
                 for i in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
@@ -309,7 +310,7 @@ class MaskedAutoencoderViT(nn.Module):
         x = self.patch_embed(x)
 
         # add pos embed w/o cls token
-        x = x + self.pos_embed[:, 1:, :]
+        x = x + self.pos_embed[:, 1:x.shape[1]+1, :]
 
         if mask_t_prob is not None:
             x, mask, ids_restore = self.random_masking_2d(
@@ -335,7 +336,7 @@ class MaskedAutoencoderViT(nn.Module):
         x = self.patch_embed(x)
 
         # add pos embed w/o cls token
-        x = x + self.pos_embed[:, 1:, :]
+        x = x + self.pos_embed[:, 1:x.shape[1]+1, :]
 
         # masking: length -> length * mask_ratio
         if mask_2d:
@@ -361,7 +362,7 @@ class MaskedAutoencoderViT(nn.Module):
         x = self.patch_embed(x)
 
         # add pos embed w/o cls token
-        x = x + self.pos_embed[:, 1:, :]
+        x = x + self.pos_embed[:, 1:x.shape[1]+1, :]
 
         # masking: length -> length * mask_ratio
         #x, mask, ids_restore = self.random_masking(x, mask_ratio)
@@ -393,7 +394,7 @@ class MaskedAutoencoderViT(nn.Module):
         x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
 
         # add pos embed
-        x = x + self.decoder_pos_embed
+        x = x + self.decoder_pos_embed[:, :x.shape[1], :]
         
         if self.decoder_mode != 0:
             B,L,D=x.shape

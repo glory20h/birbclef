@@ -10,6 +10,10 @@ init_ckpt: 'results/pt/6L-first-try/checkpoint-epoch=30.ckpt'
 exp_dir: 'results/ft/6L-mp3e-1-tl512-bce'
 
 ft_stage: 1
+filter_tail: True
+upsample_thr: 50
+downsample_thr: 
+seed: 2023
 
 batch_size: 16
 ngpus: 4
@@ -18,7 +22,8 @@ use_fp16: False
 epochs: 50
 lr: 1e-4
 
-target_len: 2048
+# target_len: 2048
+duration: 10
 depth: 6
 num_classes: 575
 

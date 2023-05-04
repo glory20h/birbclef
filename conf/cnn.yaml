@@ -6,8 +6,8 @@ xc_am_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-a-m'
 xc_nz_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-n-z'
 birb_23_path: '/mnt/work4/datasets/lyh/birdclef-2023'
 
-init_ckpt: 'results/ft/stage1-finetuned/best.ckpt'
-exp_dir: 'results/ft/2stage-tl-2048'
+init_ckpt: 
+exp_dir: 'results/ft/cnn-first-try'
 
 ft_stage: 2
 filter_tail: True
@@ -15,18 +15,26 @@ upsample_thr: 50
 downsample_thr: 
 seed: 2023
 
-batch_size: 16
+batch_size: 32
 ngpus: 2
 accumulate_grad_batches: 1
 use_fp16: False
 epochs: 40
 lr: 1e-4
 
-target_len: 2048
-duration: 10
-melbins: 128
+duration: 20
 depth: 6
 num_classes: 264
 
-mask_t_prob: 0.3
-mask_f_prob: 0.3
+mixup_prob: 0.5
+
+base_model_name: "tf_efficientnet_b0_ns"
+pretrained: True
+in_channels: 1
+
+n_fft: 2048
+n_mels: 128
+hop_length: 512
+sample_rate: 32000
+fmin: 80
+fmax: 16000
