@@ -23,7 +23,7 @@ class AttBlockV2(nn.Module):
             kernel_size=1,
             stride=1,
             padding=0,
-            bias=True
+            bias=True,
         )
         self.cla = nn.Conv1d(
             in_channels=in_features,
@@ -141,7 +141,6 @@ class TimmSED(nn.Module):
         upsampled = x[:, :, None, :].repeat(1, 1, ratio, 1)
         upsampled = upsampled.reshape(batch_size, time_steps * ratio, classes_num)
         return upsampled
-
 
     def pad_framewise_output(self, framewise_output: torch.Tensor, frames_num: int):
         """Pad framewise_output to the same length as input frames. The pad value

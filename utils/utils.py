@@ -1,6 +1,5 @@
 import os
 import numpy as np
-import pandas as pd
 
 import torch
 import torch.nn as nn
@@ -41,17 +40,21 @@ def unwrap_checkpoints(exp_path, prefix="model"):
             unwrap(os.path.join(exp_path, file), "unwrapped_" + file, prefix)
 
 
-def load_pl_state_dict(ckpt_path, prefix='model'):
-    ckpt = torch.load(ckpt_path, map_location='cpu')
-    new_state_dict = {k[len(prefix)+1:] :v for k, v in ckpt['state_dict'].items() if 'pos_embed' not in k}
+def load_pl_state_dict(state_dict, prefix='model'):
+    new_state_dict = {k[len(prefix)+1:] :v for k, v in state_dict.items()}
     return new_state_dict
 
 
 def load_state_dict_with_mismatch(model, state_dict):
     model_dict = model.state_dict()
 
+    for name in model_dict.keys():
+        if name not in state_dict:
+            print(f"Missing keys: {name} while loading checkpoint")
+
     for name, param in state_dict.items():
         if name not in model_dict:
+            print(f"Unexpected keys: {name} while loading checkpoint")
             continue
         if isinstance(param, torch.nn.Parameter):
             param = param.data
@@ -75,77 +78,6 @@ def padded_cmap(y_true, y_pred, padding_factor=5):
     return score
 
 
-def filter_data(df, thr=5):
-    # Count the number of samples for each class
-    counts = df.primary_label.value_counts()
-
-    # Condition that selects classes with less than `thr` samples
-    cond = df.primary_label.isin(counts[counts<thr].index.tolist())
-
-    # Add a new column to select samples for cross validation
-    df['cv'] = True
-
-    # Set cv = False for those class where there is samples less than thr
-    df.loc[cond, 'cv'] = False
-
-    # Return the filtered dataframe
-    return df
-    
-
-def upsample_data(df, thr=20, seed=2023):
-    # get the class distribution
-    class_dist = df['primary_label'].value_counts()
-
-    # identify the classes that have less than the threshold number of samples
-    down_classes = class_dist[class_dist < thr].index.tolist()
-
-    # create an empty list to store the upsampled dataframes
-    up_dfs = []
-
-    # loop through the undersampled classes and upsample them
-    for c in down_classes:
-        # get the dataframe for the current class
-        class_df = df.query("primary_label==@c")
-        # find number of samples to add
-        num_up = thr - class_df.shape[0]
-        # upsample the dataframe
-        class_df = class_df.sample(n=num_up, replace=True, random_state=seed)
-        # append the upsampled dataframe to the list
-        up_dfs.append(class_df)
-
-    # concatenate the upsampled dataframes and the original dataframe
-    up_df = pd.concat([df] + up_dfs, axis=0, ignore_index=True)
-    
-    return up_df
-
-
-def downsample_data(df, thr=500, seed=2023):
-    # get the class distribution
-    class_dist = df['primary_label'].value_counts()
-    
-    # identify the classes that have less than the threshold number of samples
-    up_classes = class_dist[class_dist > thr].index.tolist()
-
-    # create an empty list to store the upsampled dataframes
-    down_dfs = []
-
-    # loop through the undersampled classes and upsample them
-    for c in up_classes:
-        # get the dataframe for the current class
-        class_df = df.query("primary_label==@c")
-        # Remove that class data
-        df = df.query("primary_label!=@c")
-        # upsample the dataframe
-        class_df = class_df.sample(n=thr, replace=False, random_state=seed)
-        # append the upsampled dataframe to the list
-        down_dfs.append(class_df)
-
-    # concatenate the upsampled dataframes and the original dataframe
-    down_df = pd.concat([df] + down_dfs, axis=0, ignore_index=True)
-    
-    return down_df
-
-
 def mixup(data, targets, alpha):
     indices = torch.randperm(data.size(0))
     shuffled_data = data[indices]
@@ -165,11 +97,11 @@ class BCEFocalLoss(nn.Module):
         self.gamma = gamma
 
     def forward(self, preds, targets):
-        bce_loss = nn.BCEWithLogitsLoss(reduction='none')(preds, targets)
-        probas = torch.sigmoid(preds)
+        bce_loss = nn.BCEWithLogitsLoss(reduction='none')(preds, targets.float())
+        probs = torch.sigmoid(preds)
         loss = (
-            targets * self.alpha * (1. - probas)**self.gamma * bce_loss
-            + (1. - targets) * probas**self.gamma * bce_loss
+            targets * self.alpha * (1. - probs)**self.gamma * bce_loss
+            + (1. - targets) * probs**self.gamma * bce_loss
         )
         loss = loss.mean()
         return loss

@@ -6,8 +6,9 @@ xc_am_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-a-m'
 xc_nz_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-n-z'
 birb_23_path: '/mnt/work4/datasets/lyh/birdclef-2023'
 
-init_ckpt: 'results/pt/6L-first-try/checkpoint-epoch=30.ckpt'
-exp_dir: 'results/ft/6L-mp3e-1-tl512-bce'
+# init_ckpt: 'results/ft/debug_clf_head_test/last.ckpt'
+init_ckpt: 'audio_mae/pretrained.pth'
+exp_dir: 'results/ft/mae_proper_try_stage1'
 
 ft_stage: 1
 filter_tail: True
@@ -15,17 +16,21 @@ upsample_thr: 50
 downsample_thr: 
 seed: 2023
 
-batch_size: 16
-ngpus: 4
+batch_size: 32
+ngpus: 2
 accumulate_grad_batches: 1
 use_fp16: False
 epochs: 50
 lr: 1e-4
 
-# target_len: 2048
-duration: 10
+use_spec: True
+img_len: 2048
+duration: 20
+melbins: 128
 depth: 6
-num_classes: 575
+embed_dim: 768
+num_heads: 12
 
 mask_t_prob: 0.3
 mask_f_prob: 0.3
+mixup_prob: 0.5

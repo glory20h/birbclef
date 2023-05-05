@@ -1,6 +1,4 @@
 import os
-import sys
-import json
 import math
 import random
 import pandas as pd
@@ -17,81 +15,108 @@ from torch.utils.data import Dataset, DataLoader
 import torchaudio
 from torchaudio.compliance import kaldi
 
-from sklearn.model_selection import StratifiedKFold
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
 from pytorch_lightning import LightningModule, Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.callbacks.progress import TQDMProgressBar
-from pytorch_lightning.utilities.rank_zero import rank_zero_info
 
 from audio_mae import models_mae
+from models import AttBlockV2
+from data import prepare_data
 from utils import (
     dump_yaml,
     get_last_checkpoint,
     unwrap_checkpoints,
     load_pl_state_dict,
+    load_state_dict_with_mismatch,
     padded_cmap,
+    mixup,
+    BCEFocalLoss,
 )
 
 
 class BirbDataset(Dataset):
-    def __init__(self, dataframe, target_len):
+    def __init__(self, cfg, dataframe, augment=True):
         self.df = dataframe
+        self.duration = cfg.duration
+        self.melbins = cfg.melbins
+        self.img_len = cfg.img_len
+        self.augment = augment
         
-        self.melbins = 128
-        self.target_len = target_len
-        
-    def wav2fbank(self, filename):
-        waveform, sr = torchaudio.load(filename)
-        waveform = waveform - waveform.mean()
+        self.spec_transform = None
+        if cfg.use_spec:
+            self.spec_transform = torchaudio.transforms.Spectrogram(
+                n_fft=254,
+                hop_length=312,
+                normalized=True,
+            )
 
-        # 498 128
+    def wav2fbank(self, audio, sr):
         fbank = kaldi.fbank(
-            waveform, 
+            audio.unsqueeze(0), 
             htk_compat=True, 
             sample_frequency=sr, 
             use_energy=False,
             window_type='hanning', 
             num_mel_bins=self.melbins, 
             dither=0.0, 
-            frame_shift=10
+            frame_shift=10,
         )
-        # AudioSet: 1024 (16K sr)
-        # ESC: 512 (8K sr)
-        n_frames = fbank.shape[0]
-        p = self.target_len - n_frames
-        
-        if p > 0:
-            # repeat
-            # m = torch.nn.ZeroPad2d((0, 0, 0, p))
-            # fbank = m(fbank)
-            fbank = fbank.repeat(math.ceil(self.target_len / n_frames), 1)[:self.target_len]
-        elif p < 0:
-            # cut
-            i = random.randint(0, -p)
-            fbank = fbank[i:i+self.target_len, :]
         return fbank
+    
+    def wav2spec(self, audio):
+        spec = self.spec_transform(audio)
+        spec = spec.T[:self.img_len]
+        return spec
+    
+    def load_audio(self, filename, target_sr=32000):
+        audio, sr = torchaudio.load(filename)
+        if sr != target_sr:
+            audio = torchaudio.functional.resample(audio, sr, target_sr)
+            sr = target_sr
+        return audio[0], sr
+    
+    def cut_or_repeat(self, audio, sr):
+        target_len = int(sr * self.duration)
+        p = target_len - len(audio)
 
-    def norm_fbank(self, fbank):
-        norm_mean = -4.2677393
-        norm_std = 4.5689974
-        fbank = (fbank - norm_mean) / (norm_std * 2)
-        return fbank
+        if p > 0:
+            audio = audio.repeat(math.ceil(target_len / len(audio)))[:target_len]
+        elif p < 0:
+            i = random.randint(0, -p)
+            audio = audio[i:i+target_len]
+
+        return audio
+    
+    def add_gaussian_noise(self, audio, min_snr=5, max_snr=20):
+        snr = np.random.uniform(min_snr, max_snr)
+
+        a_signal = torch.sqrt(audio ** 2).max()
+        a_noise = a_signal / (10 ** (snr / 20))
+
+        white_noise = torch.randn(len(audio))
+        a_white = torch.sqrt(white_noise ** 2).max()
+        audio = audio + white_noise * 1 / a_white * a_noise
+
+        return audio
 
     def __getitem__(self, index):
         row = self.df.iloc[index]
-        fb = self.wav2fbank(row.filepath)
-        x = self.norm_fbank(fb)
-        x = fb.unsqueeze(0)
+        filename = row.filepath
+        label = row.label
         
-        # target = torch.zeros(NUM_CLASSES)
-        # target[row.label + row.label2] = 1
+        audio, sr = self.load_audio(filename)
+        audio = self.cut_or_repeat(audio, sr)
+        if self.augment and random.random() > 0.5:
+            audio = self.add_gaussian_noise(audio)
         
-        target = row.label
+        if self.spec_transform is not None:
+            feat = self.wav2spec(audio)
+        else:
+            feat = self.wav2fbank(audio, sr)
         
-        return x, target
+        return feat, label
 
     def __len__(self):
         return len(self.df)
@@ -109,16 +134,17 @@ class ModelWrapper(nn.Module):
             norm_layer=partial(nn.LayerNorm, eps=1e-6),
             in_chans=1,
             audio_exp=True,
-            img_size=(cfg.target_len, 128),
+            img_size=(cfg.img_len, 128),
             decoder_mode=1,
             decoder_depth=16,
         )
         self.remove_decoder()
 
         self.clf_head = nn.Sequential(
+            nn.Dropout(0.5),
             nn.Linear(768, 768),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.5),
             nn.Linear(768, cfg.num_classes),
         )
 
@@ -134,6 +160,11 @@ class ModelWrapper(nn.Module):
         self.model.decoder_pred = None
 
     def load_ckpt(self, ckpt, stage):
+        if 'pretrained.pth' in ckpt:
+            ckpt = torch.load(ckpt, map_location="cpu")
+            load_state_dict_with_mismatch(self.model, ckpt['model'])
+            return
+
         if stage == 1:
             state_dict = load_pl_state_dict(ckpt)
             self.model.load_state_dict(state_dict, strict=False)
@@ -151,6 +182,12 @@ class ModelWrapper(nn.Module):
         return x
 
 
+criterion = BCEFocalLoss()
+def mixup_criterion(preds, new_targets):
+    targets1, targets2, lam = new_targets[0], new_targets[1], new_targets[2]
+    return lam * criterion(preds, targets1.float()) + (1 - lam) * criterion(preds, targets2.float())
+
+
 class FineTuningModule(LightningModule):
     def __init__(self, cfg, train_df, val_df):
         super().__init__()
@@ -159,8 +196,8 @@ class FineTuningModule(LightningModule):
         self.batch_size = cfg.batch_size
         self.model = ModelWrapper(cfg)
 
-        self.train_data = BirbDataset(train_df, cfg.target_len)
-        self.eval_data = BirbDataset(val_df, cfg.target_len)
+        self.train_data = BirbDataset(cfg, train_df)
+        self.eval_data = BirbDataset(cfg, val_df, augment=False)
 
         self.validation_step_logits = []
         self.validation_step_targets = []
@@ -188,64 +225,110 @@ class FineTuningModule(LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        x = self.model(batch[0], self.cfg.mask_t_prob, self.cfg.mask_f_prob)
-        loss = F.cross_entropy(x, batch[1])
-        # loss = F.binary_cross_entropy_with_logits(x, batch[1])
+        inputs = batch[0].unsqueeze(1)
+        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes)
+
+        if random.random() > self.cfg.mixup_prob:
+            inputs, new_targets = mixup(inputs, targets, 0.4)
+            outputs = self.model(inputs, self.cfg.mask_t_prob, self.cfg.mask_f_prob)
+            loss = mixup_criterion(outputs, new_targets)
+        else:
+            outputs = self.model(inputs, self.cfg.mask_t_prob, self.cfg.mask_f_prob)
+            loss = criterion(outputs, targets)
 
         self.log("loss", loss)
 
         return loss
 
+        # x = self.model(batch[0].unsqueeze(1), self.cfg.mask_t_prob, self.cfg.mask_f_prob)
+        # loss = F.cross_entropy(x, batch[1])
+
+        # self.log("loss", loss)
+
+        # return loss
+
     def validation_step(self, batch, batch_idx):
-        x = self.model(batch[0], 0, 0)
-        loss = F.cross_entropy(x, batch[1])
-        # loss = F.binary_cross_entropy_with_logits(x, batch[1])
+        inputs = batch[0].unsqueeze(1)
+        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes)
+
+        outputs = self.model(inputs, 0, 0)
+        loss = criterion(outputs, targets)
 
         self.log("val_loss", loss)
 
-        self.validation_step_logits.append(x)
-        self.validation_step_targets.append(batch[1])
+        self.validation_step_logits.append(outputs)
+        self.validation_step_targets.append(targets)
+
+        # x = self.model(batch[0].unsqueeze(1), 0, 0)
+        # loss = F.cross_entropy(x, batch[1])
+        # # loss = F.binary_cross_entropy_with_logits(x, batch[1])
+
+        # self.log("val_loss", loss)
+
+        # self.validation_step_logits.append(x)
+        # self.validation_step_targets.append(batch[1])
 
     def on_validation_epoch_end(self):
-        pred = torch.cat(self.validation_step_logits)
-        target = torch.cat(self.validation_step_targets)
+        logits = torch.cat(self.validation_step_logits)
+        targets = torch.cat(self.validation_step_targets)
 
-        pred = F.softmax(pred, dim=-1).cpu().detach().numpy()
-        target = F.one_hot(target, num_classes=self.cfg.num_classes).cpu().numpy()
-        # target = target.cpu().numpy()
+        probs = torch.sigmoid(logits).cpu().detach().numpy()
+        target = targets.cpu().numpy()
 
-        cmap_pad_5 = padded_cmap(target, pred)
-        cmap_pad_1 = padded_cmap(target, pred, padding_factor=1)
+        cmap_pad_5 = padded_cmap(target, probs)
+        cmap_pad_1 = padded_cmap(target, probs, padding_factor=1)
+        acc = accuracy_score(np.argmax(target, axis=-1), np.argmax(probs, axis=-1))
 
         self.log("cmAP5", cmap_pad_5)
         self.log("cmAP1", cmap_pad_1)
+        self.log("acc", acc)
 
         self.validation_step_logits.clear()
         self.validation_step_targets.clear()
 
+        # pred = torch.cat(self.validation_step_logits)
+        # target = torch.cat(self.validation_step_targets)
+
+        # probs = F.softmax(pred, dim=-1).cpu().detach().numpy()
+        # target = F.one_hot(target, num_classes=self.cfg.num_classes).cpu().numpy()
+
+        # cmap_pad_5 = padded_cmap(target, probs)
+        # cmap_pad_1 = padded_cmap(target, probs, padding_factor=1)
+        # acc = accuracy_score(np.argmax(target, axis=-1), np.argmax(probs, axis=-1))
+
+        # self.log("cmAP5", cmap_pad_5)
+        # self.log("cmAP1", cmap_pad_1)
+        # self.log("acc", acc)
+
+        # self.validation_step_logits.clear()
+        # self.validation_step_targets.clear()
+
     def test_step(self, batch, batch_idx):
-        x = self.model(batch[0], 0, 0)
-        loss = F.cross_entropy(x, batch[1])
-        # loss = F.binary_cross_entropy_with_logits(x, batch[1])
+        inputs = batch[0].unsqueeze(1)
+        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes)
 
-        self.log("val_loss", loss)
+        outputs = self.model(inputs, 0, 0)
+        loss = criterion(outputs, targets)
 
-        self.test_step_logits.append(x)
-        self.tset_step_targets.append(batch[1])
+        self.log("test_loss", loss)
+
+        self.test_step_logits.append(outputs)
+        self.test_step_targets.append(targets)
 
     def on_test_epoch_end(self):
-        pred = torch.cat(self.test_step_logits)
-        target = torch.cat(self.test_step_targets)
+        logits = torch.cat(self.test_step_logits)
+        targets = torch.cat(self.test_step_targets)
 
-        pred = F.softmax(pred, dim=-1).cpu().detach().numpy()
-        target = F.one_hot(target, num_classes=self.cfg.num_classes).cpu().numpy()
-        # target = target.cpu().numpy()
+        probs = torch.sigmoid(logits).cpu().detach().numpy()
+        target = targets.cpu().numpy()
 
-        cmap_pad_5 = padded_cmap(target, pred)
-        cmap_pad_1 = padded_cmap(target, pred, padding_factor=1)
+        cmap_pad_5 = padded_cmap(target, probs)
+        cmap_pad_1 = padded_cmap(target, probs, padding_factor=1)
+        acc = accuracy_score(np.argmax(target, axis=-1), np.argmax(probs, axis=-1))
 
         self.log("cmAP5", cmap_pad_5)
         self.log("cmAP1", cmap_pad_1)
+        self.log("acc", acc)
 
         self.test_step_logits.clear()
         self.test_step_targets.clear()
@@ -281,130 +364,6 @@ class CustomProgressBar(TQDMProgressBar):
         return items
 
 
-def prepare_data(cfg):
-    # Data Preparation
-    # class_names = sorted(os.listdir(os.path.join(BIRB_23_PATH, 'train_audio')))
-    # class_labels = list(range(len(class_names)))
-
-    # n2l = dict(zip(class_names, class_labels))
-
-    # df_23 = pd.read_csv(f'{BIRB_23_PATH}/train_metadata.csv')
-    # df_23['filepath'] = BIRB_23_PATH + '/train_audio/' + df_23.filename
-    # df_23['label'] = df_23.primary_label.map(lambda x: [n2l[x]])
-    # df_23['label2'] = df_23.secondary_labels.map(lambda x: [n2l[n] for n in eval(x)])
-    # df_23 = df_23[['filepath', 'label', 'label2']]
-
-    # # skf = StratifiedKFold(n_splits=20, shuffle=True, random_state=2023)
-    # # df_23["fold"] = -1
-    # # for fold, (train_idx, val_idx) in enumerate(skf.split(df_23, df_23['label'])):
-    # #     df_23.loc[val_idx, 'fold'] = fold
-
-    # # train_df = df_23.query("fold!=0").reset_index(drop=True)
-    # # valid_df = df_23.query("fold==0").reset_index(drop=True)
-
-    # train_df, val_df = train_test_split(df_23, test_size=0.05, random_state=2023)
-
-    df_20 = pd.read_csv(os.path.join(cfg.birb_20_path, 'train.csv'))
-    df_20['filepath'] = cfg.birb_20_path + '/train_audio/' + df_20.ebird_code + '/' + df_20.filename
-    df_20['xc_id'] = df_20.filename.map(lambda x: x.split('.')[0])
-    df_20 = df_20[['filepath', 'filename', 'ebird_code', 'xc_id']]
-    df_20.rename(columns={"ebird_code": "primary_label"}, inplace=True)
-    df_20['birdclef'] = '20'
-
-    df_21 = pd.read_csv(os.path.join(cfg.birb_21_path, 'train_metadata.csv'))
-    df_21['filepath'] = cfg.birb_21_path + '/train_short_audio/' + df_21.primary_label + '/' + df_21.filename
-
-    corrupt_paths = [cfg.birb_21_path + '/train_short_audio/houwre/XC590621.ogg',
-                    cfg.birb_21_path + '/train_short_audio/cogdov/XC579430.ogg']
-    df_21 = df_21[~df_21.filepath.isin(corrupt_paths)]
-
-    df_21['xc_id'] = df_21.filename.map(lambda x: x.split('.')[0])
-    df_21 = df_21[['filepath', 'filename', 'primary_label', 'xc_id']]
-    df_21['birdclef'] = '21'
-
-    df_22 = pd.read_csv(os.path.join(cfg.birb_22_path, 'train_metadata.csv'))
-    df_22['filepath'] = cfg.birb_22_path + '/train_audio/' + df_22.filename
-    df_22['filename'] = df_22.filename.map(lambda x: x.split('/')[-1])
-    df_22['xc_id'] = df_22.filename.map(lambda x: x.split('.')[0])
-    df_22 = df_22[['filepath', 'filename', 'primary_label', 'xc_id']]
-    df_22['birdclef'] = '22'
-
-    df_xam = pd.read_csv(os.path.join(cfg.xc_am_path, 'train_extended.csv'))
-    df_xam = df_xam[:14685]
-    df_xam['filepath'] = cfg.xc_am_path + '/A-M/' + df_xam.ebird_code + '/' + df_xam.filename
-
-    df_xnz = pd.read_csv(os.path.join(cfg.xc_nz_path, 'train_extended.csv'))
-    df_xnz = df_xnz[14685:]
-    df_xnz['filepath'] = cfg.xc_nz_path + '/N-Z/' + df_xnz.ebird_code + '/' + df_xnz.filename
-
-    df_xc = pd.concat([df_xam, df_xnz], axis=0, ignore_index=True)
-    df_xc['xc_id'] = df_xc.filename.map(lambda x: x.split('.')[0])
-    df_xc = df_xc[['filepath', 'filename', 'ebird_code', 'xc_id']]
-    df_xc.rename(columns={"ebird_code": "primary_label"}, inplace=True)
-    df_xc['birdclef'] = 'xc'
-
-    df_23 = pd.read_csv(f'{cfg.birb_23_path}/train_metadata.csv')
-    df_23['filepath'] = cfg.birb_23_path + '/train_audio/' + df_23.filename
-    df_23['filename'] = df_23.filename.map(lambda x: x.split('/')[-1])
-    df_23['xc_id'] = df_23.filename.map(lambda x: x.split('.')[0])
-    df_23 = df_23[['filepath', 'filename', 'primary_label', 'xc_id']]
-    df_23['birdclef'] = '23'
-
-    if cfg.ft_stage == 1:
-        df_all = pd.concat([df_20, df_21, df_22, df_xc], axis=0, ignore_index=True)
-        nodup_idx = df_all[['xc_id']].drop_duplicates().index
-        df_all = df_all.loc[nodup_idx].reset_index(drop=True)
-        corrupt_files = json.load(open('corrupt_files.json', 'r'))
-        df_all = df_all[~df_all.filename.isin(corrupt_files)]
-        corrupt_files = json.load(open('corrupt_files2.json', 'r'))
-        df_all = df_all[~df_all.filename.isin(corrupt_files)]
-        df_all = df_all.reset_index(drop=True)
-
-        class_names = sorted(list(df_all.primary_label.unique()))
-        class_labels = list(range(len(class_names)))
-        n2l = dict(zip(class_names, class_labels))
-        df_all['label'] = df_all.primary_label.map(lambda x: n2l[x])
-
-    elif cfg.ft_stage == 2:
-        class_names = sorted(os.listdir(os.path.join(cfg.birb_23_path, 'train_audio')))
-        class_labels = list(range(len(class_names)))
-        n2l = dict(zip(class_names, class_labels))
-
-        df_all = pd.concat([df_20, df_21, df_22, df_xc, df_23], axis=0, ignore_index=True)
-        nodup_idx = df_all[['xc_id']].drop_duplicates().index
-        df_all = df_all.loc[nodup_idx].reset_index(drop=True)
-        corrupt_files = json.load(open('corrupt_files.json', 'r'))
-        df_all = df_all[~df_all.filename.isin(corrupt_files)]
-        corrupt_files = json.load(open('corrupt_files2.json', 'r'))
-        df_all = df_all[~df_all.filename.isin(corrupt_files)]
-        df_all = df_all[df_all.primary_label.isin(class_names)]
-        df_all = df_all.reset_index(drop=True)
-
-        df_all['label'] = df_all.primary_label.map(lambda x: n2l[x])
-
-    skf = StratifiedKFold(n_splits=20, shuffle=True, random_state=2023)
-    df_all["fold"] = -1
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df_all, df_all['label'])):
-        df_all.loc[val_idx, 'fold'] = fold
-
-    # If apply filter
-    if cfg.filter_tail:
-        df_all = filter_data(df_all, thr=5)
-        train_df = df_all.query("fold!=0 | ~cv").reset_index(drop=True)
-        val_df = df_all.query("fold==0 & cv").reset_index(drop=True)
-    else:
-        train_df = df_all.query("fold!=0").reset_index(drop=True)
-        val_df = df_all.query("fold==0").reset_index(drop=True)
-        
-    # Upsample train data
-    if cfg.upsample_thr:
-        train_df = upsample_data(train_df, thr=cfg.upsample_thr, seed=cfg.seed)
-    if cfg.downsample_thr:
-        train_df = downsample_data(train_df, thr=cfg.downsample_thr, seed=cfg.seed)
-
-    return train_df, val_df
-
-
 def main():
     parser = ArgumentParser()
     parser.add_argument('-c', '-cfg', '--config', help='config path for training')
@@ -436,7 +395,7 @@ def main():
         default_root_dir=cfg.exp_dir,
         accumulate_grad_batches=cfg.accumulate_grad_batches,
         accelerator="gpu",
-        strategy="ddp_with_unused_paramet" if cfg.ngpus > 1 else "auto",
+        strategy="ddp" if cfg.ngpus > 1 else "auto",
         devices=cfg.ngpus,
         precision=16 if cfg.use_fp16 else 32,
         max_epochs=cfg.epochs,

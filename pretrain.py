@@ -13,9 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
 import torchaudio
-from torchaudio.compliance import kaldi
 
 from sklearn.model_selection import StratifiedKFold
 from sklearn.model_selection import train_test_split
@@ -23,7 +21,6 @@ from sklearn.model_selection import train_test_split
 from pytorch_lightning import LightningModule, Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.callbacks.progress import TQDMProgressBar
-from pytorch_lightning.utilities.rank_zero import rank_zero_info
 
 from audio_mae import models_mae
 from utils import (
@@ -40,7 +37,16 @@ class BirbDataset(Dataset):
         self.df = dataframe
         self.duration = cfg.duration
         self.melbins = cfg.melbins
+        self.img_len = cfg.img_len
         self.augment = augment
+        
+        self.spec_transform = None
+        if cfg.use_spec:
+            self.spec_transform = torchaudio.transforms.Spectrogram(
+                n_fft=254,
+                hop_length=312,
+                normalized=cfg.normalize_spec,
+            )
         
     def wav2fbank(self, audio, sr):
         fbank = kaldi.fbank(
@@ -51,9 +57,14 @@ class BirbDataset(Dataset):
             window_type='hanning', 
             num_mel_bins=self.melbins, 
             dither=0.0, 
-            frame_shift=10
+            frame_shift=10,
         )
         return fbank
+    
+    def wav2spec(self, audio):
+        spec = self.spec_transform(audio)
+        spec = spec.T[:self.img_len]
+        return spec
     
     def load_audio(self, filename, target_sr=32000):
         audio, sr = torchaudio.load(filename)
@@ -69,15 +80,14 @@ class BirbDataset(Dataset):
         if p > 0:
             audio = audio.repeat(math.ceil(target_len / len(audio)))[:target_len]
         elif p < 0:
-            i = random.randint(0, -p)
+            if self.augment:
+                i = random.randint(0, -p)
+            else:
+                i = 0
             audio = audio[i:i+target_len]
 
         return audio
-    
-    def normalize(self, x):
-        x = x - x.mean()
-        return x / x.abs().max()
-    
+
     def add_gaussian_noise(self, audio, min_snr=5, max_snr=20):
         snr = np.random.uniform(min_snr, max_snr)
 
@@ -96,11 +106,13 @@ class BirbDataset(Dataset):
         
         audio, sr = self.load_audio(filename)
         audio = self.cut_or_repeat(audio, sr)
-        audio = self.normalize(audio)
             
-        fb = self.wav2fbank(audio, sr)
+        if self.spec_transform is not None:
+            feat = self.wav2spec(audio)
+        else:
+            feat = self.wav2fbank(audio, sr)
         
-        return fb
+        return feat
 
     def __len__(self):
         return len(self.df)
@@ -121,16 +133,13 @@ class PreTrainingModule(LightningModule):
             norm_layer=partial(nn.LayerNorm, eps=1e-6),
             in_chans=1,
             audio_exp=True,
-            img_size=(1024, 128),
+            img_size=(self.cfg.img_len, 128),
             decoder_mode=1,
-            decoder_depth=16,
+            decoder_depth=cfg.decoder_depth,
         )
-        if cfg.ckpt is not None:
-            ckpt = torch.load(cfg.ckpt, map_location='cpu')
-            try:
-                self.model.load_state_dict(ckpt['model'], strict=False)
-            except:
-                load_state_dict_with_mismatch(self.model, ckpt['model'])
+        if cfg.init_ckpt is not None:
+            ckpt = torch.load(cfg.init_ckpt, map_location='cpu')
+            load_state_dict_with_mismatch(self.model, ckpt['model'])
 
         self.train_data = BirbDataset(cfg, train_df)
         self.eval_data = BirbDataset(cfg, val_df, augment=False)
@@ -157,12 +166,6 @@ class PreTrainingModule(LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss, pred, mask, _ = self.model(batch.unsqueeze(1), mask_ratio=self.cfg.mask_ratio)
-
-        if torch.isnan(loss):
-            torch.save(batch, 'prob_batch.pt')
-            torch.save(self.model.state_dict(), 'prob_ckpt.pt')
-
-            raise Exception("Nan loss?")
 
         self.log("loss", loss)
 
@@ -265,7 +268,7 @@ def prepare_data(cfg):
     df_all = df_all.reset_index(drop=True)
 
     # split the data into train and validation sets
-    return train_test_split(df_all, test_size=0.05, random_state=2023)
+    return train_test_split(df_all, test_size=0.1, random_state=2023)
 
 def main():
     parser = ArgumentParser()
