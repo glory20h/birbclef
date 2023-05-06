@@ -1,5 +1,4 @@
 import os
-import math
 import random
 import pandas as pd
 import numpy as np
@@ -10,10 +9,7 @@ from omegaconf import OmegaConf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-
-import torchaudio
-from torchaudio.compliance import kaldi
+from torch.utils.data import DataLoader
 
 from sklearn.metrics import accuracy_score
 
@@ -22,8 +18,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.callbacks.progress import TQDMProgressBar
 
 from audio_mae import models_mae
-from models import AttBlockV2
-from data import prepare_data
+from data import BirbDataset, prepare_data
 from utils import (
     dump_yaml,
     get_last_checkpoint,
@@ -32,94 +27,10 @@ from utils import (
     load_state_dict_with_mismatch,
     padded_cmap,
     mixup,
-    BCEFocalLoss,
+    mixup_criterion,
+    get_criterion,
+    get_activation,
 )
-
-
-class BirbDataset(Dataset):
-    def __init__(self, cfg, dataframe, augment=True):
-        self.df = dataframe
-        self.duration = cfg.duration
-        self.melbins = cfg.melbins
-        self.img_len = cfg.img_len
-        self.augment = augment
-        
-        self.spec_transform = None
-        if cfg.use_spec:
-            self.spec_transform = torchaudio.transforms.Spectrogram(
-                n_fft=254,
-                hop_length=312,
-                normalized=True,
-            )
-
-    def wav2fbank(self, audio, sr):
-        fbank = kaldi.fbank(
-            audio.unsqueeze(0), 
-            htk_compat=True, 
-            sample_frequency=sr, 
-            use_energy=False,
-            window_type='hanning', 
-            num_mel_bins=self.melbins, 
-            dither=0.0, 
-            frame_shift=10,
-        )
-        return fbank
-    
-    def wav2spec(self, audio):
-        spec = self.spec_transform(audio)
-        spec = spec.T[:self.img_len]
-        return spec
-    
-    def load_audio(self, filename, target_sr=32000):
-        audio, sr = torchaudio.load(filename)
-        if sr != target_sr:
-            audio = torchaudio.functional.resample(audio, sr, target_sr)
-            sr = target_sr
-        return audio[0], sr
-    
-    def cut_or_repeat(self, audio, sr):
-        target_len = int(sr * self.duration)
-        p = target_len - len(audio)
-
-        if p > 0:
-            audio = audio.repeat(math.ceil(target_len / len(audio)))[:target_len]
-        elif p < 0:
-            i = random.randint(0, -p)
-            audio = audio[i:i+target_len]
-
-        return audio
-    
-    def add_gaussian_noise(self, audio, min_snr=5, max_snr=20):
-        snr = np.random.uniform(min_snr, max_snr)
-
-        a_signal = torch.sqrt(audio ** 2).max()
-        a_noise = a_signal / (10 ** (snr / 20))
-
-        white_noise = torch.randn(len(audio))
-        a_white = torch.sqrt(white_noise ** 2).max()
-        audio = audio + white_noise * 1 / a_white * a_noise
-
-        return audio
-
-    def __getitem__(self, index):
-        row = self.df.iloc[index]
-        filename = row.filepath
-        label = row.label
-        
-        audio, sr = self.load_audio(filename)
-        audio = self.cut_or_repeat(audio, sr)
-        if self.augment and random.random() > 0.5:
-            audio = self.add_gaussian_noise(audio)
-        
-        if self.spec_transform is not None:
-            feat = self.wav2spec(audio)
-        else:
-            feat = self.wav2fbank(audio, sr)
-        
-        return feat, label
-
-    def __len__(self):
-        return len(self.df)
 
 
 class ModelWrapper(nn.Module):
@@ -135,16 +46,14 @@ class ModelWrapper(nn.Module):
             in_chans=1,
             audio_exp=True,
             img_size=(cfg.img_len, 128),
-            decoder_mode=1,
-            decoder_depth=16,
         )
         self.remove_decoder()
 
         self.clf_head = nn.Sequential(
-            nn.Dropout(0.5),
+            nn.Dropout(0.1),
             nn.Linear(768, 768),
             nn.ReLU(),
-            nn.Dropout(0.5),
+            nn.Dropout(0.1),
             nn.Linear(768, cfg.num_classes),
         )
 
@@ -165,27 +74,30 @@ class ModelWrapper(nn.Module):
             load_state_dict_with_mismatch(self.model, ckpt['model'])
             return
 
+        # if stage == 1:
+        #     state_dict = load_pl_state_dict(ckpt)
+        #     self.model.load_state_dict(state_dict, strict=False)
+        # elif stage == 2:
+        #     ckpt = torch.load(ckpt, map_location='cpu')
+        #     new_state_dict = {k[6:] :v for k, v in ckpt['state_dict'].items() if 'pos_embed' not in k}
+        #     del new_state_dict['clf_head.3.weight']
+        #     del new_state_dict['clf_head.3.bias']
+        #     self.load_state_dict(new_state_dict, strict=False)
+
+        state_dict = torch.load(cfg.init_ckpt, map_location="cpu")
+        if 'pytorch-lightning_version' in state_dict:
+            state_dict = load_pl_state_dict(state_dict['state_dict'])
+
         if stage == 1:
-            state_dict = load_pl_state_dict(ckpt)
-            self.model.load_state_dict(state_dict, strict=False)
+            load_state_dict_with_mismatch(self.model, state_dict)
         elif stage == 2:
-            ckpt = torch.load(ckpt, map_location='cpu')
-            new_state_dict = {k[6:] :v for k, v in ckpt['state_dict'].items() if 'pos_embed' not in k}
-            del new_state_dict['clf_head.3.weight']
-            del new_state_dict['clf_head.3.bias']
-            self.load_state_dict(new_state_dict, strict=False)
+            load_state_dict_with_mismatch(self, state_dict)
         
     def forward(self, x, mask_t_prob, mask_f_prob):
         x = self.model.enc_forward(x, mask_t_prob, mask_f_prob)
         x = self.clf_head(x[:, 0, :])
         
         return x
-
-
-criterion = BCEFocalLoss()
-def mixup_criterion(preds, new_targets):
-    targets1, targets2, lam = new_targets[0], new_targets[1], new_targets[2]
-    return lam * criterion(preds, targets1.float()) + (1 - lam) * criterion(preds, targets2.float())
 
 
 class FineTuningModule(LightningModule):
@@ -195,6 +107,8 @@ class FineTuningModule(LightningModule):
 
         self.batch_size = cfg.batch_size
         self.model = ModelWrapper(cfg)
+        self.criterion = get_criterion(cfg.criterion)
+        self.activation = get_activation(cfg.criterion)
 
         self.train_data = BirbDataset(cfg, train_df)
         self.eval_data = BirbDataset(cfg, val_df, augment=False)
@@ -226,53 +140,37 @@ class FineTuningModule(LightningModule):
 
     def training_step(self, batch, batch_idx):
         inputs = batch[0].unsqueeze(1)
-        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes)
+        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
 
         if random.random() > self.cfg.mixup_prob:
             inputs, new_targets = mixup(inputs, targets, 0.4)
             outputs = self.model(inputs, self.cfg.mask_t_prob, self.cfg.mask_f_prob)
-            loss = mixup_criterion(outputs, new_targets)
+            loss = mixup_criterion(outputs, new_targets, self.criterion)
         else:
             outputs = self.model(inputs, self.cfg.mask_t_prob, self.cfg.mask_f_prob)
-            loss = criterion(outputs, targets)
+            loss = self.criterion(outputs, targets)
 
         self.log("loss", loss)
 
         return loss
 
-        # x = self.model(batch[0].unsqueeze(1), self.cfg.mask_t_prob, self.cfg.mask_f_prob)
-        # loss = F.cross_entropy(x, batch[1])
-
-        # self.log("loss", loss)
-
-        # return loss
-
     def validation_step(self, batch, batch_idx):
         inputs = batch[0].unsqueeze(1)
-        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes)
+        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
 
         outputs = self.model(inputs, 0, 0)
-        loss = criterion(outputs, targets)
+        loss = self.criterion(outputs, targets)
 
         self.log("val_loss", loss)
 
         self.validation_step_logits.append(outputs)
         self.validation_step_targets.append(targets)
 
-        # x = self.model(batch[0].unsqueeze(1), 0, 0)
-        # loss = F.cross_entropy(x, batch[1])
-        # # loss = F.binary_cross_entropy_with_logits(x, batch[1])
-
-        # self.log("val_loss", loss)
-
-        # self.validation_step_logits.append(x)
-        # self.validation_step_targets.append(batch[1])
-
     def on_validation_epoch_end(self):
         logits = torch.cat(self.validation_step_logits)
         targets = torch.cat(self.validation_step_targets)
 
-        probs = torch.sigmoid(logits).cpu().detach().numpy()
+        probs = self.activation(logits).detach().cpu().numpy()
         target = targets.cpu().numpy()
 
         cmap_pad_5 = padded_cmap(target, probs)
@@ -305,10 +203,10 @@ class FineTuningModule(LightningModule):
 
     def test_step(self, batch, batch_idx):
         inputs = batch[0].unsqueeze(1)
-        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes)
+        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
 
         outputs = self.model(inputs, 0, 0)
-        loss = criterion(outputs, targets)
+        loss = self.criterion(outputs, targets)
 
         self.log("test_loss", loss)
 
@@ -319,7 +217,7 @@ class FineTuningModule(LightningModule):
         logits = torch.cat(self.test_step_logits)
         targets = torch.cat(self.test_step_targets)
 
-        probs = torch.sigmoid(logits).cpu().detach().numpy()
+        probs = self.activation(logits).detach().cpu().numpy()
         target = targets.cpu().numpy()
 
         cmap_pad_5 = padded_cmap(target, probs)

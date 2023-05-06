@@ -109,6 +109,13 @@ class FineTuningModule(LightningModule):
         self.test_step_logits = []
         self.test_step_targets = []
 
+        if cfg.init_ckpt is not None:
+            ckpt = torch.load(cfg.init_ckpt, map_location="cpu")
+            if 'pytorch-lightning_version' in ckpt:
+                ckpt = load_pl_state_dict(ckpt['state_dict'])
+                
+            load_state_dict_with_mismatch(self.model, ckpt)
+
     def configure_optimizers(self):
         return torch.optim.AdamW(
             self.parameters(),

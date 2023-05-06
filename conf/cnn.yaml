@@ -6,10 +6,10 @@ xc_am_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-a-m'
 xc_nz_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-n-z'
 birb_23_path: '/mnt/work4/datasets/lyh/birdclef-2023'
 
-init_ckpt: 
-exp_dir: 'results/ft/effnet-b3-stage1'
+init_ckpt: 'results/ft/effnet-b3-stage1/unwrapped_checkpoint-epoch=48.ckpt'
+exp_dir: 'results/ft/effnet-b3-stage1-stage2'
 
-ft_stage: 1
+ft_stage: 2
 filter_tail: True
 upsample_thr: 50
 downsample_thr: 
@@ -22,11 +22,11 @@ use_fp16: False
 epochs: 50
 lr: 1e-4
 
-duration: 20
+duration: 10
 mixup_prob: 0.5
 
 base_model_name: "tf_efficientnet_b3_ns"
-pretrained: True
+pretrained: False
 in_channels: 1
 
 n_fft: 2048

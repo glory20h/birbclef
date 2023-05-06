@@ -41,7 +41,7 @@ def unwrap_checkpoints(exp_path, prefix="model"):
 
 
 def load_pl_state_dict(state_dict, prefix='model'):
-    new_state_dict = {k[len(prefix)+1:] :v for k, v in state_dict.items()}
+    new_state_dict = {k[len(prefix)+1:] :v for k, v in state_dict.items() if k.split('.')[0] == prefix}
     return new_state_dict
 
 
@@ -62,8 +62,6 @@ def load_state_dict_with_mismatch(model, state_dict):
             print(f"Ignoring size mismatch for {name} while loading checkpoint")
             continue
         model_dict[name].copy_(param)
-
-    return model
 
 
 def padded_cmap(y_true, y_pred, padding_factor=5):
@@ -89,6 +87,28 @@ def mixup(data, targets, alpha):
     return new_data, new_targets
 
 
+def mixup_criterion(preds, new_targets, criterion):
+    targets1, targets2, lam = new_targets[0], new_targets[1], new_targets[2]
+    return lam * criterion(preds, targets1) + (1 - lam) * criterion(preds, targets2)
+
+
+def get_criterion(criterion_type):
+    criterions = {
+        'focal': BCEFocalLoss(),
+        'ce': nn.CrossEntropyLoss(),
+        'bce': nn.BCEWithLogitsLoss(),
+    }
+    return criterions[criterion_type]
+
+
+def get_activation(criterion_type):
+    activations = {
+        'focal': nn.Sigmoid(),
+        'ce': nn.Softmax(dim=-1),
+        'bce': nn.Sigmoid(),
+    }
+    return activations[criterion_type]
+
 # https://www.kaggle.com/c/rfcx-species-audio-detection/discussion/213075
 class BCEFocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0):
@@ -97,7 +117,7 @@ class BCEFocalLoss(nn.Module):
         self.gamma = gamma
 
     def forward(self, preds, targets):
-        bce_loss = nn.BCEWithLogitsLoss(reduction='none')(preds, targets.float())
+        bce_loss = nn.BCEWithLogitsLoss(reduction='none')(preds, targets)
         probs = torch.sigmoid(preds)
         loss = (
             targets * self.alpha * (1. - probs)**self.gamma * bce_loss
