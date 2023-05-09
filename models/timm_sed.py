@@ -65,35 +65,35 @@ class AttBlockV2(nn.Module):
 class TimmSED(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        # Spectrogram extractor
-        self.spectrogram_extractor = Spectrogram(
-            n_fft=cfg.n_fft, 
-            hop_length=cfg.hop_length,
-            win_length=cfg.n_fft, 
-            window="hann", 
-            center=True,
-            pad_mode="reflect",
-            freeze_parameters=True
-        )
+        # # Spectrogram extractor
+        # self.spectrogram_extractor = Spectrogram(
+        #     n_fft=cfg.n_fft, 
+        #     hop_length=cfg.hop_length,
+        #     win_length=cfg.n_fft, 
+        #     window="hann", 
+        #     center=True,
+        #     pad_mode="reflect",
+        #     freeze_parameters=True
+        # )
 
-        # Logmel feature extractor
-        self.logmel_extractor = LogmelFilterBank(
-            sr=cfg.sample_rate, 
-            n_fft=cfg.n_fft,
-            n_mels=cfg.n_mels, 
-            fmin=cfg.fmin, 
-            fmax=cfg.fmax, 
-            ref=1.0, 
-            amin=1e-10, 
-            top_db=None,
-            freeze_parameters=True
-        )
+        # # Logmel feature extractor
+        # self.logmel_extractor = LogmelFilterBank(
+        #     sr=cfg.sample_rate, 
+        #     n_fft=cfg.n_fft,
+        #     n_mels=cfg.n_mels, 
+        #     fmin=cfg.fmin, 
+        #     fmax=cfg.fmax, 
+        #     ref=1.0, 
+        #     amin=1e-10, 
+        #     top_db=None,
+        #     freeze_parameters=True
+        # )
 
-        # Spec augmenter
-        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2,
-                                               freq_drop_width=8, freq_stripes_num=2)
+        # # Spec augmenter
+        # self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2,
+        #                                        freq_drop_width=8, freq_stripes_num=2)
 
-        self.bn0 = nn.BatchNorm2d(cfg.n_mels)
+        # self.bn0 = nn.BatchNorm2d(cfg.n_mels)
 
         base_model = timm.create_model(
             cfg.base_model_name, 
@@ -115,7 +115,7 @@ class TimmSED(nn.Module):
 
     def init_weight(self):
         self.init_layer(self.fc1)
-        self.init_bn(self.bn0)
+        # self.init_bn(self.bn0)
 
     def init_layer(self, layer):
         nn.init.xavier_uniform_(layer.weight)
@@ -159,21 +159,24 @@ class TimmSED(nn.Module):
 
         return output
 
-    def forward(self, input):
-        x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
-        x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+    def forward(self, x):
+        # x = self.spectrogram_extractor(x)   # (batch_size, 1, time_steps, freq_bins)
+        # x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
 
-        frames_num = x.shape[2]
+        # frames_num = x.shape[2]
 
-        x = x.transpose(1, 3)
-        x = self.bn0(x)
-        x = x.transpose(1, 3)
+        # x = x.transpose(1, 3)
+        # x = self.bn0(x)
+        # x = x.transpose(1, 3)
 
-        if self.training:
-            x = self.spec_augmenter(x)
+        # if self.training:
+        #     x = self.spec_augmenter(x)
 
-        x = x.transpose(2, 3)
+        # x = x.transpose(2, 3)
         # (batch_size, channels, freq, frames)
+        x = x.unsqueeze(1)
+        frames_num = x.shape[3]
+
         x = self.encoder(x)
 
         # (batch_size, channels, frames)

@@ -6,28 +6,32 @@ xc_am_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-a-m'
 xc_nz_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-n-z'
 birb_23_path: '/mnt/work4/datasets/lyh/birdclef-2023'
 
-init_ckpt: 'audio_mae/pretrained.pth'
-# init_ckpt: 
-exp_dir: 'results/ft/ft-stage1'
+birdvox_path: "/mnt/work2/users/lyh/datasets/BirdVox-DCASE-20k"
+ff1010_path: "/mnt/work2/users/lyh/datasets/ff1010bird"
 
-ft_stage: 1
+# init_ckpt: 'audio_mae/pretrained.pth'
+init_ckpt: 'results/ft/ft-stage1-5e-3/unwrapped_checkpoint-epoch=47.ckpt'
+exp_dir: 'results/ft/ft-stage1-1e-4-stage2'
+
+ft_stage: 2
 filter_tail: True
-upsample_thr: 50
+upsample_thr: True
 downsample_thr: 
 seed: 2023
+fold: 1
 
 batch_size: 32
 ngpus: 2
 accumulate_grad_batches: 1
-use_fp16: False
-epochs: 50
-lr: 5e-4
-criterion: ce
+use_fp16: True
+epochs: 30
+lr: 1e-4
+criterion: ce     # 'focal', 'bce', 'ce'
 
-feat: kaldi_fb    # 'spec', 'mel_spec', 'tl_spec', 'kaldi_fb'
+feat: kaldi_fb    # 'spec', 'mel_spec', 'tl_spec', 'kaldi_fb', 'leaf'
 img_len: 1024
 duration: 10
-melbins: 128
+n_mels: 128
 depth: 6
 embed_dim: 768
 num_heads: 12
@@ -36,9 +40,6 @@ mask_t_prob: 0.3
 mask_f_prob: 0.3
 mixup_prob: 0.5
 
-# n_fft: 2048
-# n_mels: 128
-# hop_length: 512
-# sample_rate: 32000
-# fmin: 80
-# fmax: 16000
+sample_rate: 32000
+fmin: 80
+fmax: 16000

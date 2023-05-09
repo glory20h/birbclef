@@ -137,7 +137,7 @@ def main():
     cfg_path = args.config
     cfg = OmegaConf.load(cfg_path)
 
-    train_df, val_df = prepare_data_with_no_labels(cfg)
+    train_df, val_df = prepare_data(cfg, labels=False)
 
     model = PreTrainingModule(cfg, train_df, val_df)
 

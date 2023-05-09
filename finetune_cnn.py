@@ -12,9 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-import torchaudio
-
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score
 
 from pytorch_lightning import LightningModule, Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
@@ -22,7 +20,8 @@ from pytorch_lightning.callbacks.progress import TQDMProgressBar
 
 from audio_mae import models_mae
 from models import TimmSED
-from data import prepare_data
+from data import BirbDataset, prepare_data
+from leaf_pytorch.frontend import Leaf
 from utils import (
     dump_yaml,
     get_last_checkpoint,
@@ -31,66 +30,10 @@ from utils import (
     load_state_dict_with_mismatch,
     padded_cmap,
     mixup,
-    BCEFocal2WayLoss,
+    mixup_criterion,
+    get_criterion,
+    get_activation,
 )
-
-class BirbDataset2(Dataset):
-    def __init__(self, cfg, dataframe, augment=True):
-        self.df = dataframe
-        self.duration = cfg.duration
-        self.augment = augment
-    
-    def load_audio(self, filename, target_sr=32000):
-        audio, sr = torchaudio.load(filename)
-        if sr != target_sr:
-            audio = torchaudio.functional.resample(audio, sr, target_sr)
-            sr = target_sr
-        return audio[0], sr
-    
-    def cut_or_repeat(self, audio, sr):
-        target_len = sr * self.duration
-        p = target_len - len(audio)
-
-        if p > 0:
-            audio = audio.repeat(math.ceil(target_len / len(audio)))[:target_len]
-        elif p < 0:
-            i = random.randint(0, -p)
-            audio = audio[i:i+target_len]
-
-        return audio
-    
-    def add_gaussian_noise(self, audio, min_snr=5, max_snr=20):
-        snr = np.random.uniform(min_snr, max_snr)
-
-        a_signal = torch.sqrt(audio ** 2).max()
-        a_noise = a_signal / (10 ** (snr / 20))
-
-        white_noise = torch.randn(len(audio))
-        a_white = torch.sqrt(white_noise ** 2).max()
-        audio = audio + white_noise * 1 / a_white * a_noise
-
-        return audio
-
-    def __getitem__(self, index):
-        row = self.df.iloc[index]
-        filename = row.filepath
-        label = row.label
-        
-        audio, sr = self.load_audio(filename)
-        audio = self.cut_or_repeat(audio, sr)
-        if self.augment and random.random() > 0.5:
-            audio = self.add_gaussian_noise(audio)
-        
-        return audio, label
-
-    def __len__(self):
-        return len(self.df)
-
-
-criterion = BCEFocal2WayLoss()
-def mixup_criterion(preds, new_targets):
-    targets1, targets2, lam = new_targets[0], new_targets[1], new_targets[2]
-    return lam * criterion(preds, targets1) + (1 - lam) * criterion(preds, targets2)
 
 
 class FineTuningModule(LightningModule):
@@ -100,21 +43,34 @@ class FineTuningModule(LightningModule):
 
         self.batch_size = cfg.batch_size
         self.model = TimmSED(cfg)
-
-        self.train_data = BirbDataset2(cfg, train_df)
-        self.eval_data = BirbDataset2(cfg, val_df, augment=False)
-
-        self.validation_step_logits = []
-        self.validation_step_targets = []
-        self.test_step_logits = []
-        self.test_step_targets = []
-
         if cfg.init_ckpt is not None:
             ckpt = torch.load(cfg.init_ckpt, map_location="cpu")
             if 'pytorch-lightning_version' in ckpt:
                 ckpt = load_pl_state_dict(ckpt['state_dict'])
                 
             load_state_dict_with_mismatch(self.model, ckpt)
+
+        self.criterion = get_criterion(cfg.criterion)
+        self.activation = get_activation(cfg.criterion)
+
+        self.train_data = BirbDataset(cfg, train_df)
+        self.eval_data = BirbDataset(cfg, val_df, augment=False)
+
+        self.validation_step_logits = []
+        self.validation_step_targets = []
+        self.test_step_logits = []
+        self.test_step_targets = []
+
+        self.leaf = None
+        if cfg.feat == "leaf":
+            self.leaf = Leaf(
+                n_filters=cfg.n_mels,
+                sample_rate=cfg.sample_rate,
+                window_len=25.0,
+                window_stride=10.,
+                init_min_freq=cfg.fmin,
+                init_max_freq=cfg.fmax,
+            )
 
     def configure_optimizers(self):
         return torch.optim.AdamW(
@@ -138,15 +94,18 @@ class FineTuningModule(LightningModule):
 
     def training_step(self, batch, batch_idx):
         inputs = batch[0]
-        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes)
+        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
+
+        if self.leaf is not None:
+            inputs = self.leaf(inputs.unsqueeze(1))
 
         if random.random() > self.cfg.mixup_prob:
             inputs, new_targets = mixup(inputs, targets, 0.4)
             outputs = self.model(inputs)
-            loss = mixup_criterion(outputs, new_targets)
+            loss = mixup_criterion(outputs, new_targets, self.criterion)
         else:
             outputs = self.model(inputs)
-            loss = criterion(outputs, targets)
+            loss = self.criterion(outputs, targets)
 
         self.log("loss", loss)
 
@@ -154,10 +113,13 @@ class FineTuningModule(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         inputs = batch[0]
-        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes)
+        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
+
+        if self.leaf is not None:
+            inputs = self.leaf(inputs.unsqueeze(1))
 
         outputs = self.model(inputs)
-        loss = criterion(outputs, targets)
+        loss = self.criterion(outputs, targets)
 
         self.log("val_loss", loss)
 
@@ -169,26 +131,30 @@ class FineTuningModule(LightningModule):
         targets = torch.cat(self.validation_step_targets)
 
         probs = torch.sigmoid(logits).cpu().detach().numpy()
-        target = targets.cpu().numpy()
+        targets = targets.cpu().numpy()
 
-        cmap_pad_5 = padded_cmap(target, probs)
-        cmap_pad_1 = padded_cmap(target, probs, padding_factor=1)
-
-        acc = accuracy_score(np.argmax(target, axis=-1), np.argmax(probs, axis=-1))
+        cmap_pad_5 = padded_cmap(targets, probs)
+        cmap_pad_1 = padded_cmap(targets, probs, padding_factor=1)
+        acc = accuracy_score(np.argmax(targets, axis=-1), np.argmax(probs, axis=-1))
+        f1 = f1_score(targets, probs > 0.5, average='micro')
 
         self.log("cmAP5", cmap_pad_5)
         self.log("cmAP1", cmap_pad_1)
         self.log("acc", acc)
+        self.log("f1", f1)
 
         self.validation_step_logits.clear()
         self.validation_step_targets.clear()
 
     def test_step(self, batch, batch_idx):
         inputs = batch[0]
-        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes)
+        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
+
+        if self.leaf is not None:
+            inputs = self.leaf(inputs.unsqueeze(1))
 
         outputs = self.model(inputs)
-        loss = criterion(outputs, targets)
+        loss = self.criterion(outputs, targets)
 
         self.log("test_loss", loss)
 
@@ -200,16 +166,18 @@ class FineTuningModule(LightningModule):
         targets = torch.cat(self.test_step_targets)
 
         probs = torch.sigmoid(logits).cpu().detach().numpy()
-        target = targets.cpu().numpy()
+        targets = targets.cpu().numpy()
 
-        cmap_pad_5 = padded_cmap(target, probs)
-        cmap_pad_1 = padded_cmap(target, probs, padding_factor=1)
+        cmap_pad_5 = padded_cmap(targets, probs)
+        cmap_pad_1 = padded_cmap(targets, probs, padding_factor=1)
 
-        acc = accuracy_score(np.argmax(target, axis=-1), np.argmax(probs, axis=-1))
+        acc = accuracy_score(np.argmax(targets, axis=-1), np.argmax(probs, axis=-1))
+        f1 = f1_score(targets, probs > 0.5, average='micro')
 
         self.log("cmAP5", cmap_pad_5)
         self.log("cmAP1", cmap_pad_1)
         self.log("acc", acc)
+        self.log("f1", f1)
 
         self.test_step_logits.clear()
         self.test_step_targets.clear()

@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score
 
 from pytorch_lightning import LightningModule, Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
@@ -19,6 +19,7 @@ from pytorch_lightning.callbacks.progress import TQDMProgressBar
 
 from audio_mae import models_mae
 from data import BirbDataset, prepare_data
+from leaf_pytorch.frontend import Leaf
 from utils import (
     dump_yaml,
     get_last_checkpoint,
@@ -38,7 +39,7 @@ class ModelWrapper(nn.Module):
         super().__init__()
         self.model = models_mae.MaskedAutoencoderViT(
             patch_size=16, 
-            embed_dim=768, 
+            embed_dim=cfg.embed_dim, 
             depth=cfg.depth, 
             num_heads=12,
             mlp_ratio=4, 
@@ -56,6 +57,17 @@ class ModelWrapper(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(768, cfg.num_classes),
         )
+
+        self.leaf = None
+        if cfg.feat == "leaf":
+            self.leaf = Leaf(
+                n_filters=cfg.melbins,
+                sample_rate=cfg.sample_rate,
+                window_len=25.0,
+                window_stride=10.,
+                init_min_freq=cfg.fmin,
+                init_max_freq=cfg.fmax,
+            )
 
         if cfg.init_ckpt is not None:
             self.load_ckpt(cfg.init_ckpt, cfg.ft_stage)
@@ -84,16 +96,21 @@ class ModelWrapper(nn.Module):
         #     del new_state_dict['clf_head.3.bias']
         #     self.load_state_dict(new_state_dict, strict=False)
 
-        state_dict = torch.load(cfg.init_ckpt, map_location="cpu")
+        state_dict = torch.load(ckpt, map_location="cpu")
         if 'pytorch-lightning_version' in state_dict:
             state_dict = load_pl_state_dict(state_dict['state_dict'])
 
+        # TODO : Fix this!!!
         if stage == 1:
             load_state_dict_with_mismatch(self.model, state_dict)
         elif stage == 2:
             load_state_dict_with_mismatch(self, state_dict)
         
     def forward(self, x, mask_t_prob, mask_f_prob):
+        x = x.unsqueeze(1)
+        if self.leaf is not None:
+            x = self.leaf(x).transpose(1,2).unsqueeze(1)
+
         x = self.model.enc_forward(x, mask_t_prob, mask_f_prob)
         x = self.clf_head(x[:, 0, :])
         
@@ -139,7 +156,7 @@ class FineTuningModule(LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        inputs = batch[0].unsqueeze(1)
+        inputs = batch[0]
         targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
 
         if random.random() > self.cfg.mixup_prob:
@@ -155,7 +172,7 @@ class FineTuningModule(LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        inputs = batch[0].unsqueeze(1)
+        inputs = batch[0]
         targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
 
         outputs = self.model(inputs, 0, 0)
@@ -171,38 +188,23 @@ class FineTuningModule(LightningModule):
         targets = torch.cat(self.validation_step_targets)
 
         probs = self.activation(logits).detach().cpu().numpy()
-        target = targets.cpu().numpy()
+        targets = targets.cpu().numpy()
 
-        cmap_pad_5 = padded_cmap(target, probs)
-        cmap_pad_1 = padded_cmap(target, probs, padding_factor=1)
-        acc = accuracy_score(np.argmax(target, axis=-1), np.argmax(probs, axis=-1))
+        cmap_pad_5 = padded_cmap(targets, probs)
+        cmap_pad_1 = padded_cmap(targets, probs, padding_factor=1)
+        acc = accuracy_score(np.argmax(targets, axis=-1), np.argmax(probs, axis=-1))
+        f1 = f1_score(targets, probs > 0.5, average='micro')
 
         self.log("cmAP5", cmap_pad_5)
         self.log("cmAP1", cmap_pad_1)
         self.log("acc", acc)
+        self.log("f1", f1)
 
         self.validation_step_logits.clear()
         self.validation_step_targets.clear()
 
-        # pred = torch.cat(self.validation_step_logits)
-        # target = torch.cat(self.validation_step_targets)
-
-        # probs = F.softmax(pred, dim=-1).cpu().detach().numpy()
-        # target = F.one_hot(target, num_classes=self.cfg.num_classes).cpu().numpy()
-
-        # cmap_pad_5 = padded_cmap(target, probs)
-        # cmap_pad_1 = padded_cmap(target, probs, padding_factor=1)
-        # acc = accuracy_score(np.argmax(target, axis=-1), np.argmax(probs, axis=-1))
-
-        # self.log("cmAP5", cmap_pad_5)
-        # self.log("cmAP1", cmap_pad_1)
-        # self.log("acc", acc)
-
-        # self.validation_step_logits.clear()
-        # self.validation_step_targets.clear()
-
     def test_step(self, batch, batch_idx):
-        inputs = batch[0].unsqueeze(1)
+        inputs = batch[0]
         targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
 
         outputs = self.model(inputs, 0, 0)
@@ -218,15 +220,17 @@ class FineTuningModule(LightningModule):
         targets = torch.cat(self.test_step_targets)
 
         probs = self.activation(logits).detach().cpu().numpy()
-        target = targets.cpu().numpy()
+        targets = targets.cpu().numpy()
 
-        cmap_pad_5 = padded_cmap(target, probs)
-        cmap_pad_1 = padded_cmap(target, probs, padding_factor=1)
-        acc = accuracy_score(np.argmax(target, axis=-1), np.argmax(probs, axis=-1))
+        cmap_pad_5 = padded_cmap(targets, probs)
+        cmap_pad_1 = padded_cmap(targets, probs, padding_factor=1)
+        acc = accuracy_score(np.argmax(targets, axis=-1), np.argmax(probs, axis=-1))
+        f1 = f1_score(targets, probs > 0.5, average='micro')
 
         self.log("cmAP5", cmap_pad_5)
         self.log("cmAP1", cmap_pad_1)
         self.log("acc", acc)
+        self.log("f1", f1)
 
         self.test_step_logits.clear()
         self.test_step_targets.clear()

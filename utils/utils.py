@@ -94,6 +94,7 @@ def mixup_criterion(preds, new_targets, criterion):
 
 def get_criterion(criterion_type):
     criterions = {
+        '2way': BCEFocal2WayLoss(),
         'focal': BCEFocalLoss(),
         'ce': nn.CrossEntropyLoss(),
         'bce': nn.BCEWithLogitsLoss(),
@@ -103,6 +104,7 @@ def get_criterion(criterion_type):
 
 def get_activation(criterion_type):
     activations = {
+        '2way': nn.Sigmoid(),
         'focal': nn.Sigmoid(),
         'ce': nn.Softmax(dim=-1),
         'bce': nn.Sigmoid(),

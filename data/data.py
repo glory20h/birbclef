@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 import torch
+import torch.nn as nn 
 from torch.utils.data import Dataset
 import torchaudio
 from torchaudio.compliance import kaldi
@@ -101,7 +102,7 @@ def downsample_data(df, thr=500, seed=2023):
     return down_df
 
 
-def prepare_data(cfg):
+def prepare_data(cfg, labels=True):
     df_20 = pd.read_csv(os.path.join(cfg.birb_20_path, 'train.csv'))
     df_20['filepath'] = cfg.birb_20_path + '/train_audio/' + df_20.ebird_code + '/' + df_20.filename
     df_20['xc_id'] = df_20.filename.map(lambda x: x.split('.')[0])
@@ -148,53 +149,45 @@ def prepare_data(cfg):
     df_23 = df_23[['filepath', 'filename', 'primary_label', 'xc_id']]
     df_23['birdclef'] = '23'
 
-    if cfg.ft_stage == 1:
-        df_all = pd.concat([df_20, df_21, df_22, df_xc], axis=0, ignore_index=True)
-        nodup_idx = df_all[['xc_id']].drop_duplicates().index
-        df_all = df_all.loc[nodup_idx].reset_index(drop=True)
-        corrupt_files = json.load(open('corrupt_files.json', 'r'))
-        df_all = df_all[~df_all.filename.isin(corrupt_files)]
-        corrupt_files = json.load(open('corrupt_files2.json', 'r'))
-        df_all = df_all[~df_all.filename.isin(corrupt_files)]
+    df_all = pd.concat([df_20, df_21, df_22, df_xc, df_23], axis=0, ignore_index=True)
+    nodup_idx = df_all[['xc_id']].drop_duplicates().index
+    df_all = df_all.loc[nodup_idx]
+    corrupt_files = json.load(open('corrupt_files.json', 'r'))
+    df_all = df_all[~df_all.filename.isin(corrupt_files)]
+    corrupt_files = json.load(open('corrupt_files2.json', 'r'))
+    df_all = df_all[~df_all.filename.isin(corrupt_files)]
+
+    if not labels:
         df_all = df_all.reset_index(drop=True)
+        return train_test_split(df_all, test_size=0.1, random_state=cfg.seed)
 
+    if cfg.ft_stage == 1:
         class_names = sorted(list(df_all.primary_label.unique()))
-        cfg.num_classes = len(class_names)
-        class_labels = list(range(len(class_names)))
-        n2l = dict(zip(class_names, class_labels))
-        df_all['label'] = df_all.primary_label.map(lambda x: n2l[x])
-
     elif cfg.ft_stage == 2:
         class_names = sorted(os.listdir(os.path.join(cfg.birb_23_path, 'train_audio')))
-        cfg.num_classes = len(class_names)
-        class_labels = list(range(len(class_names)))
-        n2l = dict(zip(class_names, class_labels))
-
-        df_all = pd.concat([df_20, df_21, df_22, df_xc, df_23], axis=0, ignore_index=True)
-        nodup_idx = df_all[['xc_id']].drop_duplicates().index
-        df_all = df_all.loc[nodup_idx].reset_index(drop=True)
-        corrupt_files = json.load(open('corrupt_files.json', 'r'))
-        df_all = df_all[~df_all.filename.isin(corrupt_files)]
-        corrupt_files = json.load(open('corrupt_files2.json', 'r'))
-        df_all = df_all[~df_all.filename.isin(corrupt_files)]
         df_all = df_all[df_all.primary_label.isin(class_names)]
-        df_all = df_all.reset_index(drop=True)
 
-        df_all['label'] = df_all.primary_label.map(lambda x: n2l[x])
+    cfg.num_classes = len(class_names)
+    class_labels = list(range(len(class_names)))
+    n2l = dict(zip(class_names, class_labels))
+        
+    df_all['label'] = df_all.primary_label.map(lambda x: n2l[x])
+    df_all = df_all.reset_index(drop=True)
 
-    skf = StratifiedKFold(n_splits=20, shuffle=True, random_state=2023)
+    skf = StratifiedKFold(n_splits=20, shuffle=True, random_state=cfg.seed)
     df_all["fold"] = -1
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df_all, df_all['label'])):
-        df_all.loc[val_idx, 'fold'] = fold
+    for f, (train_idx, val_idx) in enumerate(skf.split(df_all, df_all['label'])):
+        df_all.loc[val_idx, 'fold'] = f
 
     # If apply filter
+    fold = cfg.fold
     if cfg.filter_tail:
         df_all = filter_data(df_all, thr=5)
-        train_df = df_all.query("fold!=0 | ~cv").reset_index(drop=True)
-        val_df = df_all.query("fold==0 & cv").reset_index(drop=True)
+        train_df = df_all.query("fold!="+str(fold)+" | ~cv").reset_index(drop=True)
+        val_df = df_all.query("fold=="+str(fold)+" & cv").reset_index(drop=True)
     else:
-        train_df = df_all.query("fold!=0").reset_index(drop=True)
-        val_df = df_all.query("fold==0").reset_index(drop=True)
+        train_df = df_all.query("fold!="+str(fold)).reset_index(drop=True)
+        val_df = df_all.query("fold=="+str(fold)).reset_index(drop=True)
         
     # # Upsample train data
     # if cfg.upsample_thr:
@@ -264,7 +257,25 @@ def prepare_data_with_no_labels(cfg):
     df_all = df_all.reset_index(drop=True)
 
     # split the data into train and validation sets
-    return train_test_split(df_all, test_size=0.1, random_state=2023)
+    return train_test_split(df_all, test_size=0.1, random_state=cfg.seed)
+
+
+def prepare_noise_data(cfg):
+    df_bv20k = pd.read_csv(os.path.join(cfg.birdvox_path, 'BirdVoxDCASE20k_csvpublic.csv'))
+    df_bv20k['filepath'] = df_bv20k['itemid'].apply(lambda x: os.path.join(cfg.birdvox_path, "wav" , str(x)+".wav"))
+    bv_nb = df_bv20k.query('hasbird == 0')
+    bv_nb = bv_nb[['filepath']]
+    bv_nb['data'] = 'bv'
+    
+    df_ff = pd.read_csv(os.path.join(cfg.ff1010_path, "ff1010bird_metadata_2018.csv"))
+    df_ff['filepath'] = df_ff['itemid'].apply(lambda x: os.path.join(cfg.ff1010_path, "wav" , str(x)+".wav"))
+    ff_nb = df_ff.query('hasbird == 0')
+    ff_nb = ff_nb[['filepath']]
+    ff_nb['data'] = 'ff'
+    
+    df_all = pd.concat([bv_nb, ff_nb], axis=0, ignore_index=True)
+    
+    return df_all
 
 
 class TorchLibrosaSpectrogram:
@@ -281,16 +292,18 @@ class TorchLibrosaSpectrogram:
 
         # Logmel feature extractor
         self.logmel_extractor = LogmelFilterBank(
-            sr=32000, 
+            sr=cfg.sample_rate, 
             n_fft=2048,
-            n_mels=128, 
-            fmin=80, 
-            fmax=16000, 
+            n_mels=cfg.n_mels, 
+            fmin=cfg.fmin, 
+            fmax=cfg.fmax, 
             ref=1.0, 
             amin=1e-10, 
             top_db=None,
             freeze_parameters=True,
         )
+
+        self.bn0 = nn.BatchNorm2d(cfg.n_mels)
 
     def __call__(self, audio):
         feat = self.spectrogram_extractor(audio.unsqueeze(0))
@@ -301,12 +314,14 @@ class TorchLibrosaSpectrogram:
 
 
 class BirbDataset(Dataset):
-    def __init__(self, cfg, dataframe, augment=True):
+    def __init__(self, cfg, dataframe, augment=True, return_raw=False):
         self.df = dataframe
         self.duration = cfg.duration
-        self.melbins = cfg.melbins
+        self.n_mels = cfg.n_mels
         self.img_len = cfg.img_len
+        self.target_sr = cfg.sample_rate
         self.augment = augment
+        self.return_raw = return_raw
         
         self.spec_transform = None
         if cfg.feat == 'spec':
@@ -321,15 +336,18 @@ class BirbDataset(Dataset):
         elif cfg.feat == 'mel_spec':
             self.spec_transform = nn.Sequential(
                 torchaudio.transforms.MelSpectrogram(
-                    sample_rate=32000,
+                    sample_rate=cfg.sample_rate,
                     n_fft=625,
-                    f_min=80,
-                    f_max=16000,
+                    f_min=cfg.fmin,
+                    f_max=cfg.fmax,
+                    normalized=True,
                 ),
                 torchaudio.transforms.AmplitudeToDB(),
             )
         elif cfg.feat == 'tl_spec':
             self.spec_transform = TorchLibrosaSpectrogram(cfg)
+        elif cfg.feat == 'leaf':
+            self.spec_transform = "leaf"
         
         self.spec_augmenter = None
         if augment:
@@ -339,6 +357,8 @@ class BirbDataset(Dataset):
                 freq_drop_width=8, 
                 freq_stripes_num=2,
             )
+            
+        self.noise_df = prepare_noise_data(cfg)
 
     def wav2fbank(self, audio, sr):
         fbank = kaldi.fbank(
@@ -347,11 +367,11 @@ class BirbDataset(Dataset):
             sample_frequency=sr, 
             use_energy=False,
             window_type='hanning', 
-            num_mel_bins=self.melbins, 
+            num_mel_bins=self.n_mels, 
             dither=0.0, 
             frame_shift=10,
-            # low_freq=80,
-            # high_freq=16000,
+            # low_freq=80, # default 20.0
+            # high_freq=16000, # default 0.0
         )
         return fbank
     
@@ -390,18 +410,58 @@ class BirbDataset(Dataset):
         audio = audio + white_noise * 1 / a_white * a_noise
 
         return audio
+    
+    def add_noise(self, audio, min_snr=5, max_snr=20):
+        snr = np.random.uniform(min_snr, max_snr)
+
+        a_signal = torch.sqrt(audio ** 2).max()
+        a_signal = a_signal / (10 ** (snr / 20))
+
+        noise, sr = self.load_audio(
+            self.noise_df.filepath.iloc[random.randint(0, len(self.noise_df)-1)],
+            self.target_sr,
+        )
+        noise = self.cut_or_repeat(noise, sr)
+        a_noise = torch.sqrt(noise ** 2).max()
+        audio = audio + noise * 1 / a_noise * a_signal
+
+        return audio
+    
+    def denoise(self, audio, max_thr=0.2, max_scale=0.5):
+        thr = random.uniform(0.05, max_thr)
+        scale = random.uniform(max_scale, 1)
+        thr = ((audio.max() - audio.min()) / 2) * thr
+        audio[audio.abs() < thr] *= scale
+        return audio
+    
+    def high_pass(self, audio, sr=32000):
+        cutoff_freq = random.uniform(200, 2500)
+        return torchaudio.functional.highpass_biquad(
+            audio,
+            sr,
+            cutoff_freq=cutoff_freq,
+        )
 
     def __getitem__(self, index):
         row = self.df.iloc[index]
         filename = row.filepath
         label = row.label
         
-        audio, sr = self.load_audio(filename)
+        audio, sr = self.load_audio(filename, self.target_sr)
         audio = self.cut_or_repeat(audio, sr)
-        if self.augment and random.random() > 0.5:
-            audio = self.add_gaussian_noise(audio)
+        if self.augment:
+            if random.random() > 0.5:
+                audio = self.denoise(audio)
+            if random.random() > 0.5:
+                audio = self.high_pass(audio, sr)
+            if random.random() > 0.5:
+                audio = self.add_gaussian_noise(audio)
+            if random.random() > 0.5:
+                audio = self.add_noise(audio)
         
-        if self.spec_transform is not None:
+        if self.spec_transform == "leaf":
+            return audio, label
+        elif self.spec_transform is not None:
             feat = self.wav2spec(audio)
         else:
             feat = self.wav2fbank(audio, sr)
@@ -409,8 +469,11 @@ class BirbDataset(Dataset):
         if self.augment:
             feat = feat.unsqueeze(0).unsqueeze(0)
             feat = self.spec_augmenter(feat).squeeze()
+
+        if self.return_raw:
+            return feat, label, audio
         
-        return feat, label, audio
+        return feat, label
 
     def __len__(self):
         return len(self.df)
