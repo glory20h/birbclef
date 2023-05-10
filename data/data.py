@@ -17,7 +17,7 @@ from imblearn.over_sampling import RandomOverSampler
 
 from torchlibrosa.stft import LogmelFilterBank, Spectrogram
 from torchlibrosa.augmentation import SpecAugmentation
-
+import glob
 
 def filter_data(df, thr=5):
     # Count the number of samples for each class
@@ -272,9 +272,21 @@ def prepare_noise_data(cfg):
     ff_nb = df_ff.query('hasbird == 0')
     ff_nb = ff_nb[['filepath']]
     ff_nb['data'] = 'ff'
-    
-    df_all = pd.concat([bv_nb, ff_nb], axis=0, ignore_index=True)
-    
+
+    poland_files = glob.glob(os.path.join(cfg.PolandNFC_path, "*.wav"))
+    df_poland = pd.DataFrame({"filepath": poland_files})
+    df_poland["data"] = "pn"
+
+    chern_files = glob.glob(os.path.join(cfg.chern_wav_path, "*.wav"))
+    df_chern = pd.DataFrame({"filepath": chern_files})
+    df_chern["data"] = "ch"
+
+    wabrlrb_files = glob.glob(os.path.join(cfg.wabrlrb10k_path, "*.wav"))
+    df_wabrlrb = pd.DataFrame({"filepath": wabrlrb_files})
+    df_wabrlrb["data"] = "wb"
+
+    df_all = pd.concat([bv_nb, ff_nb, df_poland, df_chern, df_wabrlrb], axis=0, ignore_index=True)
+
     return df_all
 
 

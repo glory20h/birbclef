@@ -1,16 +1,19 @@
 # Dataset Paths
-birb_20_path: '/mnt/work4/datasets/lyh/birdsong-recognition'
-birb_21_path: '/mnt/work4/datasets/lyh/birdclef-2021'
-birb_22_path: '/mnt/work4/datasets/lyh/birdclef-2022'
-xc_am_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-a-m'
-xc_nz_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-n-z'
-birb_23_path: '/mnt/work4/datasets/lyh/birdclef-2023'
+birb_20_path: 'D:/birdclef/birbclef/conf/birdsong-recognition'
+birb_21_path: 'D:/birdclef/birbclef/conf/birdclef-2021'
+birb_22_path: 'D:/birdclef/birbclef/conf/birdclef-2022'
+xc_am_path: 'D:/birdclef/birbclef/conf/xeno-canto-bird-recordings-extended-a-m'
+xc_nz_path: 'D:/birdclef/birbclef/conf/xeno-canto-bird-recordings-extended-n-z'
+birb_23_path: 'D:/birdclef/birbclef/conf/birdclef-2023'
 
-birdvox_path: "/mnt/work2/users/lyh/datasets/BirdVox-DCASE-20k"
-ff1010_path: "/mnt/work2/users/lyh/datasets/ff1010bird"
+birdvox_path: "D:/birdclef/birbclef/conf/BirdVox-DCASE-20k"
+ff1010_path: "D:/birdclef/birbclef/conf/ff1010bird"
+PolandNFC_path: "D:/birdclef/birbclef/conf/PolandNFC_test_wav"
+chern_wav_path: "D:/birdclef/birbclef/conf/chern_wav"
+wabrlrb10k_path: "D:/birdclef/birbclef/conf/wabrlrb10k"
 
 init_ckpt: 
-exp_dir: 'results/ft/b0-leaf-test'
+exp_dir: 'D:/birdclef/birbclef/results/ft/b0-leaf-test'
 
 ft_stage: 2
 filter_tail: True
@@ -20,11 +23,11 @@ seed: 2023
 fold: 0
 
 batch_size: 32
-ngpus: 2
+ngpus: 1
 accumulate_grad_batches: 1
 use_fp16: False
 epochs: 50
-lr: 1e-4
+lr: 3e-4
 criterion: 2way
 
 duration: 10
