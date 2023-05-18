@@ -28,6 +28,7 @@ from utils import (
     load_state_dict_with_mismatch,
     padded_cmap,
     mixup,
+    new_mixup,
     mixup_criterion,
     get_criterion,
     get_activation,
@@ -41,33 +42,22 @@ class ModelWrapper(nn.Module):
             patch_size=16, 
             embed_dim=cfg.embed_dim, 
             depth=cfg.depth, 
-            num_heads=12,
+            num_heads=cfg.num_heads,
             mlp_ratio=4, 
             norm_layer=partial(nn.LayerNorm, eps=1e-6),
             in_chans=1,
             audio_exp=True,
-            img_size=(cfg.img_len, 128),
+            img_size=(cfg.img_len, cfg.n_mels),
         )
         self.remove_decoder()
 
         self.clf_head = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(768, 768),
+            nn.Linear(cfg.embed_dim, cfg.embed_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(768, cfg.num_classes),
+            nn.Linear(cfg.embed_dim, cfg.num_classes),
         )
-
-        self.leaf = None
-        if cfg.feat == "leaf":
-            self.leaf = Leaf(
-                n_filters=cfg.melbins,
-                sample_rate=cfg.sample_rate,
-                window_len=25.0,
-                window_stride=10.,
-                init_min_freq=cfg.fmin,
-                init_max_freq=cfg.fmax,
-            )
 
         if cfg.init_ckpt is not None:
             self.load_ckpt(cfg.init_ckpt, cfg.ft_stage)
@@ -86,30 +76,20 @@ class ModelWrapper(nn.Module):
             load_state_dict_with_mismatch(self.model, ckpt['model'])
             return
 
-        # if stage == 1:
-        #     state_dict = load_pl_state_dict(ckpt)
-        #     self.model.load_state_dict(state_dict, strict=False)
-        # elif stage == 2:
-        #     ckpt = torch.load(ckpt, map_location='cpu')
-        #     new_state_dict = {k[6:] :v for k, v in ckpt['state_dict'].items() if 'pos_embed' not in k}
-        #     del new_state_dict['clf_head.3.weight']
-        #     del new_state_dict['clf_head.3.bias']
-        #     self.load_state_dict(new_state_dict, strict=False)
-
         state_dict = torch.load(ckpt, map_location="cpu")
         if 'pytorch-lightning_version' in state_dict:
             state_dict = load_pl_state_dict(state_dict['state_dict'])
 
-        # TODO : Fix this!!!
         if stage == 1:
             load_state_dict_with_mismatch(self.model, state_dict)
         elif stage == 2:
+            # TODO : Enhance this!!!
             load_state_dict_with_mismatch(self, state_dict)
+            load_state_dict_with_mismatch(self.model, state_dict)
         
     def forward(self, x, mask_t_prob, mask_f_prob):
-        x = x.unsqueeze(1)
-        if self.leaf is not None:
-            x = self.leaf(x).transpose(1,2).unsqueeze(1)
+        if len(x.shape) == 3:
+            x = x.unsqueeze(1)
 
         x = self.model.enc_forward(x, mask_t_prob, mask_f_prob)
         x = self.clf_head(x[:, 0, :])
@@ -157,15 +137,21 @@ class FineTuningModule(LightningModule):
 
     def training_step(self, batch, batch_idx):
         inputs = batch[0]
-        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
+        targets = batch[1]
 
+        # if random.random() > self.cfg.mixup_prob:
+        #     inputs, new_targets = mixup(inputs, targets, 0.4)
+        #     outputs = self.model(inputs, self.cfg.mask_t_prob, self.cfg.mask_f_prob)
+        #     loss = mixup_criterion(outputs, new_targets, self.criterion)
+        # else:
+        #     outputs = self.model(inputs, self.cfg.mask_t_prob, self.cfg.mask_f_prob)
+        #     loss = self.criterion(outputs, targets)
+        
         if random.random() > self.cfg.mixup_prob:
-            inputs, new_targets = mixup(inputs, targets, 0.4)
-            outputs = self.model(inputs, self.cfg.mask_t_prob, self.cfg.mask_f_prob)
-            loss = mixup_criterion(outputs, new_targets, self.criterion)
-        else:
-            outputs = self.model(inputs, self.cfg.mask_t_prob, self.cfg.mask_f_prob)
-            loss = self.criterion(outputs, targets)
+            inputs, new_targets = new_mixup(inputs, targets)
+
+        outputs = self.model(inputs, self.cfg.mask_t_prob, self.cfg.mask_f_prob)
+        loss = self.criterion(outputs, targets)
 
         self.log("loss", loss)
 
@@ -173,7 +159,7 @@ class FineTuningModule(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         inputs = batch[0]
-        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
+        targets = batch[1]
 
         outputs = self.model(inputs, 0, 0)
         loss = self.criterion(outputs, targets)
@@ -205,7 +191,7 @@ class FineTuningModule(LightningModule):
 
     def test_step(self, batch, batch_idx):
         inputs = batch[0]
-        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
+        targets = batch[1]
 
         outputs = self.model(inputs, 0, 0)
         loss = self.criterion(outputs, targets)
@@ -299,7 +285,7 @@ def main():
         accelerator="gpu",
         strategy="ddp" if cfg.ngpus > 1 else "auto",
         devices=cfg.ngpus,
-        precision=16 if cfg.use_fp16 else 32,
+        precision="16-mixed" if cfg.use_fp16 else 32,
         max_epochs=cfg.epochs,
         callbacks=[ckpt_callback, CustomProgressBar()],
     )

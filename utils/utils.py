@@ -76,7 +76,7 @@ def padded_cmap(y_true, y_pred, padding_factor=5):
     return score
 
 
-def mixup(data, targets, alpha):
+def mixup(data, targets, alpha=0.4):
     indices = torch.randperm(data.size(0))
     shuffled_data = data[indices]
     shuffled_targets = targets[indices]
@@ -84,6 +84,18 @@ def mixup(data, targets, alpha):
     lam = np.random.beta(alpha, alpha)
     new_data = data * lam + shuffled_data * (1 - lam)
     new_targets = [targets, shuffled_targets, lam]
+    return new_data, new_targets
+
+
+def new_mixup(inputs, targets):
+    indices = torch.randperm(inputs.size(0))
+    shuffled_data = inputs[indices]
+    shuffled_targets = targets[indices]
+
+    lam = np.random.uniform(0.3, 0.7)
+    new_data = inputs * lam + shuffled_data * (1 - lam)
+    new_targets = targets + shuffled_targets
+    new_targets = new_targets.clamp(max=1.0)
     return new_data, new_targets
 
 
@@ -96,7 +108,7 @@ def get_criterion(criterion_type):
     criterions = {
         '2way': BCEFocal2WayLoss(),
         'focal': BCEFocalLoss(),
-        'ce': nn.CrossEntropyLoss(),
+        'ce': nn.CrossEntropyLoss(label_smoothing=0.01),
         'bce': nn.BCEWithLogitsLoss(),
     }
     return criterions[criterion_type]
@@ -119,6 +131,9 @@ class BCEFocalLoss(nn.Module):
         self.gamma = gamma
 
     def forward(self, preds, targets):
+        if type(preds) == dict:
+            preds = preds["logit"]
+        
         bce_loss = nn.BCEWithLogitsLoss(reduction='none')(preds, targets)
         probs = torch.sigmoid(preds)
         loss = (

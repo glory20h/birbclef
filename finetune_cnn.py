@@ -18,10 +18,8 @@ from pytorch_lightning import LightningModule, Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.callbacks.progress import TQDMProgressBar
 
-from audio_mae import models_mae
 from models import TimmSED
 from data import BirbDataset, prepare_data
-from leaf_pytorch.frontend import Leaf
 from utils import (
     dump_yaml,
     get_last_checkpoint,
@@ -30,6 +28,7 @@ from utils import (
     load_state_dict_with_mismatch,
     padded_cmap,
     mixup,
+    new_mixup,
     mixup_criterion,
     get_criterion,
     get_activation,
@@ -61,17 +60,6 @@ class FineTuningModule(LightningModule):
         self.test_step_logits = []
         self.test_step_targets = []
 
-        self.leaf = None
-        if cfg.feat == "leaf":
-            self.leaf = Leaf(
-                n_filters=cfg.n_mels,
-                sample_rate=cfg.sample_rate,
-                window_len=25.0,
-                window_stride=10.,
-                init_min_freq=cfg.fmin,
-                init_max_freq=cfg.fmax,
-            )
-
     def configure_optimizers(self):
         return torch.optim.AdamW(
             self.parameters(),
@@ -94,18 +82,23 @@ class FineTuningModule(LightningModule):
 
     def training_step(self, batch, batch_idx):
         inputs = batch[0]
-        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
+        targets = batch[1]
 
-        if self.leaf is not None:
-            inputs = self.leaf(inputs.unsqueeze(1))
-
+        # if random.random() > self.cfg.mixup_prob:
+        #     # inputs, new_targets = mixup(inputs, targets, 0.4)
+        #     inputs, new_targets = new_mixup(inputs, targets)
+        #     outputs = self.model(inputs)
+        #     # loss = mixup_criterion(outputs, new_targets, self.criterion)
+        #     loss = self.criterion(outputs, new_targets)
+        # else:
+        #     outputs = self.model(inputs)
+        #     loss = self.criterion(outputs, targets)
+            
         if random.random() > self.cfg.mixup_prob:
-            inputs, new_targets = mixup(inputs, targets, 0.4)
-            outputs = self.model(inputs)
-            loss = mixup_criterion(outputs, new_targets, self.criterion)
-        else:
-            outputs = self.model(inputs)
-            loss = self.criterion(outputs, targets)
+            inputs, targets = new_mixup(inputs, targets)
+            
+        outputs = self.model(inputs)
+        loss = self.criterion(outputs, targets)
 
         self.log("loss", loss)
 
@@ -113,10 +106,7 @@ class FineTuningModule(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         inputs = batch[0]
-        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
-
-        if self.leaf is not None:
-            inputs = self.leaf(inputs.unsqueeze(1))
+        targets = batch[1]
 
         outputs = self.model(inputs)
         loss = self.criterion(outputs, targets)
@@ -148,10 +138,7 @@ class FineTuningModule(LightningModule):
 
     def test_step(self, batch, batch_idx):
         inputs = batch[0]
-        targets = F.one_hot(batch[1], num_classes=self.cfg.num_classes).float()
-
-        if self.leaf is not None:
-            inputs = self.leaf(inputs.unsqueeze(1))
+        targets = batch[1]
 
         outputs = self.model(inputs)
         loss = self.criterion(outputs, targets)
@@ -247,7 +234,7 @@ def main():
         # strategy="ddp_find_unused_parameters_true" if cfg.ngpus > 1 else "auto",
         strategy="ddp" if cfg.ngpus > 1 else "auto",
         devices=cfg.ngpus,
-        precision=16 if cfg.use_fp16 else 32,
+        precision="16-mixed" if cfg.use_fp16 else 32,
         max_epochs=cfg.epochs,
         callbacks=[ckpt_callback, CustomProgressBar()],
     )

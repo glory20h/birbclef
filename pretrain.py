@@ -47,7 +47,7 @@ class PreTrainingModule(LightningModule):
             norm_layer=partial(nn.LayerNorm, eps=1e-6),
             in_chans=1,
             audio_exp=True,
-            img_size=(self.cfg.img_len, 128),
+            img_size=(self.cfg.img_len, cfg.n_mels),
             decoder_mode=1,
             decoder_depth=cfg.decoder_depth,
         )

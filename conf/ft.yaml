@@ -1,46 +1,47 @@
 # Dataset Paths
-birb_20_path: 'D:/birdclef/birbclef/conf/birdsong-recognition'
-birb_21_path: 'D:/birdclef/birbclef/conf/birdclef-2021'
-birb_22_path: 'D:/birdclef/birbclef/conf/birdclef-2022'
-xc_am_path: 'D:/birdclef/birbclef/conf/xeno-canto-bird-recordings-extended-a-m'
-xc_nz_path: 'D:/birdclef/birbclef/conf/xeno-canto-bird-recordings-extended-n-z'
-birb_23_path: 'D:/birdclef/birbclef/conf/birdclef-2023'
+birb_20_path: '/mnt/work4/datasets/lyh/birdsong-recognition'
+birb_21_path: '/mnt/work4/datasets/lyh/birdclef-2021'
+birb_22_path: '/mnt/work4/datasets/lyh/birdclef-2022'
+xc_am_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-a-m'
+xc_nz_path: '/mnt/work4/datasets/lyh/xeno-canto-bird-recordings-extended-n-z'
+birb_23_path: '/mnt/work4/datasets/lyh/birdclef-2023'
 
-birdvox_path: "D:/birdclef/birbclef/conf/BirdVox-DCASE-20k"
-ff1010_path: "D:/birdclef/birbclef/conf/ff1010bird"
-PolandNFC_path: "D:/birdclef/birbclef/conf/PolandNFC_test_wav"
-chern_wav_path: "D:/birdclef/birbclef/conf/chern_wav"
-wabrlrb10k_path: "D:/birdclef/birbclef/conf/wabrlrb10k"
+birdvox_path: "/mnt/work4/datasets/lyh/BirdVox-DCASE-20k"
+ff1010_path: "/mnt/work4/datasets/lyh/ff1010bird"
+warblrb10k_path: "/mnt/work4/datasets/lyh/warblrb10k"
+# PolandNFC_path: "/mnt/work4/datasets/lyh/PolandNFC_test_wav"
+# chern_wav_path: "/mnt/work4/datasets/lyh/chern_wav"
 
 # init_ckpt: 'audio_mae/pretrained.pth'
-init_ckpt: 
-exp_dir: 'D:/birdclef/birbclef/results/ft/ft-check'
+init_ckpt: /home/lyh/birbclef/results/ft/frompt-stage1-stage2/unwrapped_checkpoint-epoch=11.ckpt
+exp_dir: 'results/ft/mae-fromft-1e-4'
 
 ft_stage: 2
+temporal_label: df_all_thr15.csv
 filter_tail: True
 upsample_thr: True
 downsample_thr: 
-seed: 2023
-fold: 1
+seed: 123456789
+fold: 0
 
 batch_size: 32
 ngpus: 2
 accumulate_grad_batches: 1
 use_fp16: True
-epochs: 30
+epochs: 50
 lr: 1e-4
-criterion: ce     # 'focal', 'bce', 'ce'
+criterion: focal     # 'focal', 'bce', 'ce'
 
-feat: kaldi_fb    # 'spec', 'mel_spec', 'tl_spec', 'kaldi_fb', 'leaf'
-img_len: 1024
-duration: 10
+feat: kaldi_fb    # 'spec', 'mel_spec', 'tl_spec', 'kaldi_fb', 'leaf', 'audio'
+img_len: 512
+duration: 5
 n_mels: 128
 depth: 6
 embed_dim: 768
 num_heads: 12
 
-mask_t_prob: 0.3
-mask_f_prob: 0.3
+mask_t_prob: 0.1
+mask_f_prob: 0.1
 mixup_prob: 0.5
 
 sample_rate: 32000
