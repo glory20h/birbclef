@@ -13,15 +13,15 @@ warblrb10k_path: "/mnt/work4/datasets/lyh/warblrb10k"
 # chern_wav_path: "/mnt/work4/datasets/lyh/chern_wav"
 
 # init_ckpt: 'audio_mae/pretrained.pth'
-init_ckpt: /home/lyh/birbclef/results/ft/frompt-stage1-stage2/unwrapped_checkpoint-epoch=11.ckpt
-exp_dir: 'results/ft/mae-fromft-1e-4'
+init_ckpt: /home/lyh/birbclef/results/ft/mae-fromft-1e-4+50epoch/unwrapped_checkpoint-epoch=49.ckpt
+exp_dir: 'results/ft/mae-4L-test'
 
 ft_stage: 2
 temporal_label: df_all_thr15.csv
 filter_tail: True
 upsample_thr: True
 downsample_thr: 
-seed: 123456789
+seed: 9876
 fold: 0
 
 batch_size: 32
@@ -29,7 +29,7 @@ ngpus: 2
 accumulate_grad_batches: 1
 use_fp16: True
 epochs: 50
-lr: 1e-4
+lr: 1e-5
 criterion: focal     # 'focal', 'bce', 'ce'
 
 feat: kaldi_fb    # 'spec', 'mel_spec', 'tl_spec', 'kaldi_fb', 'leaf', 'audio'
@@ -40,8 +40,8 @@ depth: 6
 embed_dim: 768
 num_heads: 12
 
-mask_t_prob: 0.1
-mask_f_prob: 0.1
+mask_t_prob: 0.3
+mask_f_prob: 0.3
 mixup_prob: 0.5
 
 sample_rate: 32000

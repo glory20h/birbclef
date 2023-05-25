@@ -123,9 +123,11 @@ class FineTuningModule(LightningModule):
         probs = torch.sigmoid(logits).cpu().detach().numpy()
         targets = targets.cpu().numpy()
 
+        acc = accuracy_score(np.argmax(targets, axis=-1), np.argmax(probs, axis=-1))
+        targets[targets == 0.5] = 1.0
+
         cmap_pad_5 = padded_cmap(targets, probs)
         cmap_pad_1 = padded_cmap(targets, probs, padding_factor=1)
-        acc = accuracy_score(np.argmax(targets, axis=-1), np.argmax(probs, axis=-1))
         f1 = f1_score(targets, probs > 0.5, average='micro')
 
         self.log("cmAP5", cmap_pad_5)
@@ -155,10 +157,11 @@ class FineTuningModule(LightningModule):
         probs = torch.sigmoid(logits).cpu().detach().numpy()
         targets = targets.cpu().numpy()
 
+        acc = accuracy_score(np.argmax(targets, axis=-1), np.argmax(probs, axis=-1))
+        targets[targets == 0.5] = 1.0
+
         cmap_pad_5 = padded_cmap(targets, probs)
         cmap_pad_1 = padded_cmap(targets, probs, padding_factor=1)
-
-        acc = accuracy_score(np.argmax(targets, axis=-1), np.argmax(probs, axis=-1))
         f1 = f1_score(targets, probs > 0.5, average='micro')
 
         self.log("cmAP5", cmap_pad_5)
